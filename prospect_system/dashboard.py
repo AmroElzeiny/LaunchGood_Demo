@@ -332,6 +332,21 @@ def _has_draft(state: ProspectAnalysisState | None) -> bool:
     return any(str(draft.get(key) or "").strip() for key in ("subject", "body", "cta"))
 
 
+def _has_analysis_progress(state: ProspectAnalysisState | None) -> bool:
+    if state is None:
+        return False
+    return any(
+        (
+            state.scraped_pages,
+            state.skipped_pages,
+            state.prospect_cards,
+            state.errors,
+            str(state.extracted_text or "").strip(),
+            state.completed_at,
+        )
+    )
+
+
 def _latest_blocked_error(state: ProspectAnalysisState | None) -> Any | None:
     if not isinstance(state, ProspectAnalysisState):
         return None
@@ -380,16 +395,16 @@ def _is_step_complete(
 ) -> bool:
     is_running = bool(st.session_state.get("prospect_analysis_running", False))
     if step == 1:
-        return is_running or state is not None
+        return _has_analysis_progress(state)
     if step == 2:
         return bool(state and state.prospect_cards and not is_running)
     if step == 3:
-        return current_step > 3 or bool(state and state.completed_at)
+        return bool(state and state.prospect_cards)
     if step == 4:
-        return _has_draft(state) or current_step > 4
+        return _has_draft(state)
     if step == 5:
         return bool(state and state.completed_at)
-    return current_step > step
+    return False
 
 
 def _render_workflow_progress(state: ProspectAnalysisState | None) -> None:
@@ -2131,7 +2146,6 @@ def _render_draft_step(
     ):
         with st.spinner("Generating email draft..."):
             _generate_draft(settings, state, card)
-            _set_draft_widget_values(state, selected_index=selected_index)
         st.rerun()
 
     _render_draft_fields(state, selected_index=selected_index)
@@ -2169,23 +2183,25 @@ def _render_draft_step(
             st.session_state["prospect_state"] = state
             _go_to_step(5)
 
-    st.divider()
-    st.subheader("Regenerate draft")
-    regenerate_instruction = st.text_area(
-        "Regeneration note",
-        key=f"regen_instruction_{state.session_id}_{selected_index}",
-        placeholder="Tell the AI what to change in the next draft.",
-        height=90,
-    )
-    if st.button(
-        "Regenerate with note",
-        use_container_width=True,
-        key=f"regen_{state.session_id}_{selected_index}",
-    ):
-        with st.spinner("Regenerating draft..."):
-            _generate_draft(settings, state, card, instruction=regenerate_instruction)
-            _set_draft_widget_values(state, selected_index=selected_index)
-        st.rerun()
+    if _has_draft(state):
+        st.divider()
+        st.subheader("Regenerate draft")
+        regenerate_instruction = st.text_area(
+            "Regeneration note",
+            key=f"regen_instruction_{state.session_id}_{selected_index}",
+            placeholder="Tell the AI what to change in the next draft.",
+            height=90,
+        )
+        if st.button(
+            "Regenerate with note",
+            use_container_width=True,
+            key=f"regen_{state.session_id}_{selected_index}",
+        ):
+            with st.spinner("Regenerating draft..."):
+                _generate_draft(
+                    settings, state, card, instruction=regenerate_instruction
+                )
+            st.rerun()
 
 
 def _decision_preview_html(state: ProspectAnalysisState, card: Any) -> str:
