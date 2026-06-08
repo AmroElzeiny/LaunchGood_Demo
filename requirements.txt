@@ -1,3 +1,5 @@
+msgspec==0.20.0
+
 # Core app
 openai==2.26.0
 python-dotenv==1.2.2
