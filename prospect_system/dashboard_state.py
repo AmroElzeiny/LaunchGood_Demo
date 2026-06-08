@@ -108,6 +108,9 @@ class ProspectAnalysisState:
     human_decision: str = ""
     crm_stage: str = ""
     google_sheet_status: str = ""
+    google_sheet_decision_tab: str = ""
+    google_sheet_decision_row: int = 0
+    google_sheet_decision_range: str = ""
     telegram_or_slack_alert_sent: str = ""
     errors: list[ErrorRecord] = field(default_factory=list)
     started_at: str = field(default_factory=utc_now_iso)

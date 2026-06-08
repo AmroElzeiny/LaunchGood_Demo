@@ -17,6 +17,9 @@ SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 class SheetAppendResult:
     success: bool
     message: str
+    tab_name: str = ""
+    updated_range: str = ""
+    row_number: int | None = None
 
 
 def _cell(value: Any) -> Any:
@@ -57,9 +60,51 @@ class GoogleSheetsClient:
             self._clear_updated_row_background(
                 tab_name, updated_range, column_count=len(row_values)
             )
-            return SheetAppendResult(True, f"Saved to Google Sheets tab: {tab_name}")
+            row_number = self._row_number_from_updated_range(updated_range)
+            return SheetAppendResult(
+                True,
+                f"Saved to Google Sheets tab: {tab_name}",
+                tab_name=tab_name,
+                updated_range=updated_range,
+                row_number=row_number,
+            )
         except Exception as exc:  # noqa: BLE001
             return SheetAppendResult(False, f"Google Sheets API failure: {exc}")
+
+    def delete_row(self, tab_name: str, row_number: int) -> SheetAppendResult:
+        if not self.settings.is_google_configured:
+            return SheetAppendResult(False, "Google Sheets is not configured in .env.")
+        if row_number <= 0:
+            return SheetAppendResult(False, "Google Sheets row number is missing.")
+        try:
+            sheet_id = self._sheet_id_for_tab(tab_name)
+            if sheet_id is None:
+                return SheetAppendResult(False, f"Google Sheets tab not found: {tab_name}")
+            self._get_service().spreadsheets().batchUpdate(
+                spreadsheetId=self.settings.google_sheet_id,
+                body={
+                    "requests": [
+                        {
+                            "deleteDimension": {
+                                "range": {
+                                    "sheetId": sheet_id,
+                                    "dimension": "ROWS",
+                                    "startIndex": row_number - 1,
+                                    "endIndex": row_number,
+                                }
+                            }
+                        }
+                    ]
+                },
+            ).execute()
+            return SheetAppendResult(
+                True,
+                f"Removed row {row_number} from Google Sheets tab: {tab_name}",
+                tab_name=tab_name,
+                row_number=row_number,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return SheetAppendResult(False, f"Google Sheets row deletion failed: {exc}")
 
     def append_step(
         self, state: ProspectAnalysisState, step: StepLog

@@ -108,6 +108,34 @@ class ProspectDecisionHandler:
             )
         return DecisionResult(result.success, result.message)
 
+    def remove_decision_from_sheet(self, state: ProspectAnalysisState) -> DecisionResult:
+        tab_name = str(getattr(state, "google_sheet_decision_tab", "") or "").strip()
+        row_number = int(getattr(state, "google_sheet_decision_row", 0) or 0)
+        if not tab_name or row_number <= 0:
+            return DecisionResult(
+                False,
+                "No tracked CRM sheet row was found for this decision, so I could not remove it automatically.",
+            )
+        result = self.sheets.delete_row(tab_name, row_number)
+        if not result.success:
+            self._error(
+                state,
+                stage="google_sheets",
+                message=result.message,
+                url=state.current_url,
+            )
+            return DecisionResult(False, result.message)
+        state.google_sheet_decision_tab = ""
+        state.google_sheet_decision_row = 0
+        state.google_sheet_decision_range = ""
+        self._log(
+            state,
+            f"Removed previous CRM sheet decision row from {tab_name} row {row_number}",
+            stage="decision",
+            url=state.current_url,
+        )
+        return DecisionResult(True, result.message)
+
     def send_outreach(
         self,
         state: ProspectAnalysisState,
@@ -200,6 +228,14 @@ class ProspectDecisionHandler:
         result = self.sheets.append_row(tab_name, row)
         self._log_evidence_summary(state, card=card)
         state.google_sheet_status = result.message
+        if result.success:
+            state.google_sheet_decision_tab = result.tab_name or tab_name
+            state.google_sheet_decision_row = int(result.row_number or 0)
+            state.google_sheet_decision_range = result.updated_range
+        else:
+            state.google_sheet_decision_tab = ""
+            state.google_sheet_decision_row = 0
+            state.google_sheet_decision_range = ""
         self.state_logger.write_decision(
             state,
             {
@@ -209,6 +245,8 @@ class ProspectDecisionHandler:
                 "crm_stage": state.crm_stage,
                 "notes": notes,
                 "google_sheet_status": result.message,
+                "google_sheet_decision_tab": state.google_sheet_decision_tab,
+                "google_sheet_decision_row": state.google_sheet_decision_row,
             },
         )
         return result

@@ -6,8 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from prospect_system.dashboard_state import ProspectAnalysisState, ScrapedPage
+from prospect_system.google_sheets_client import SheetAppendResult
 from prospect_system.prospect_card import ProspectCard
-from prospect_system.prospect_config import load_prospect_settings
+from prospect_system.prospect_config import SHEET_TABS, load_prospect_settings
+from prospect_system.prospect_decision_handler import ProspectDecisionHandler
 from prospect_system.prospect_flow import ProspectFlow
 from prospect_system.prospect_scraper import ProspectScraper, normalize_input_urls
 
@@ -297,3 +299,90 @@ def test_prospect_card_sheet_row_contains_decision_and_draft() -> None:
     assert row[18] == "Yes"
     assert row[20] == "Hello"
     assert row[22] == "me@example.com"
+
+
+def test_decision_handler_tracks_and_removes_saved_crm_row(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _set_required_env(monkeypatch)
+    settings = load_prospect_settings(tmp_path)
+    events: list[tuple] = []
+
+    class _FakeSheetsClient:
+        def __init__(self, settings):
+            del settings
+
+        def append_row(self, tab_name, values):
+            events.append(("append_row", tab_name, values))
+            return SheetAppendResult(
+                True,
+                f"Saved to Google Sheets tab: {tab_name}",
+                tab_name=tab_name,
+                updated_range=f"'{tab_name}'!A12:W12",
+                row_number=12,
+            )
+
+        def append_step(self, state, step):
+            del state
+            events.append(("append_step", step.stage, step.message))
+            return SheetAppendResult(True, "Logged")
+
+        def append_error(self, error):
+            events.append(("append_error", error.stage, error.message))
+            return SheetAppendResult(True, "Logged error")
+
+        def append_dashboard_metric(self, values):
+            events.append(("append_metric", values))
+            return SheetAppendResult(True, "Metric saved")
+
+        def delete_row(self, tab_name, row_number):
+            events.append(("delete_row", tab_name, row_number))
+            return SheetAppendResult(
+                True,
+                f"Removed row {row_number} from Google Sheets tab: {tab_name}",
+                tab_name=tab_name,
+                row_number=row_number,
+            )
+
+    monkeypatch.setattr(
+        "prospect_system.prospect_decision_handler.GoogleSheetsClient",
+        _FakeSheetsClient,
+    )
+
+    state = ProspectAnalysisState.create(
+        input_urls=["https://acme.test/"],
+        target_criteria="education",
+        outreach_goal="partnership",
+    )
+    state.current_url = "https://acme.test/"
+    card = ProspectCard(
+        company="Acme",
+        website="https://acme.test/",
+        category="Education",
+        fit_score=88,
+        fit_status="Strong Fit",
+        reason="Good evidence",
+        pain_point="Manual outreach",
+        suggested_offer="Automation",
+        recommended_contact_type="Partnership lead",
+        confidence="High",
+        next_step="Approve",
+        source_session_id=state.session_id,
+    )
+
+    handler = ProspectDecisionHandler(settings)
+    save_result = handler.approve_to_crm(state, card=card, notes="ok")
+
+    assert save_result.success
+    assert state.completed_at
+    assert state.google_sheet_decision_tab == SHEET_TABS["approved"]
+    assert state.google_sheet_decision_row == 12
+    assert state.google_sheet_decision_range == f"'{SHEET_TABS['approved']}'!A12:W12"
+
+    remove_result = handler.remove_decision_from_sheet(state)
+
+    assert remove_result.success
+    assert ("delete_row", SHEET_TABS["approved"], 12) in events
+    assert state.google_sheet_decision_tab == ""
+    assert state.google_sheet_decision_row == 0
+    assert state.google_sheet_decision_range == ""

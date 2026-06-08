@@ -107,6 +107,55 @@ def _init_session() -> None:
     st.session_state.setdefault("prospect_history", [])
 
 
+def _reset_prospect_session_state() -> None:
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(("prospect_", "draft_")):
+            del st.session_state[key]
+    _init_session()
+    st.session_state["prospect_current_step"] = 1
+
+
+def _handle_refresh_reset_query() -> None:
+    try:
+        should_reset = str(st.query_params.get("prospect_reset") or "") == "1"
+    except Exception:
+        should_reset = False
+    if not should_reset:
+        return
+    _reset_prospect_session_state()
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+    st.rerun()
+
+
+def _install_refresh_reset_detector() -> None:
+    components.html(
+        """
+        <script>
+        (() => {
+            const perf = window.parent.performance || window.performance;
+            const entries = perf && perf.getEntriesByType ? perf.getEntriesByType("navigation") : [];
+            const navType = entries && entries[0] ? entries[0].type : "";
+            if (navType !== "reload") {
+                return;
+            }
+            const url = new URL(window.parent.location.href);
+            if (url.searchParams.get("prospect_reset") === "1") {
+                return;
+            }
+            url.searchParams.set("prospect_reset", "1");
+            url.searchParams.delete("prospect_step");
+            window.parent.location.replace(url.toString());
+        })();
+        </script>
+        """,
+        height=0,
+        scrolling=False,
+    )
+
+
 def _format_seconds(seconds: float) -> str:
     seconds = max(0, int(seconds))
     minutes, remainder = divmod(seconds, 60)
@@ -1150,6 +1199,46 @@ def _record_draft_generated(
     st.session_state["prospect_local_metrics"]["generated_outreach_drafts"] += 1
 
 
+def _draft_field_keys(
+    state: ProspectAnalysisState, selected_index: int
+) -> dict[str, str]:
+    prefix = f"draft_edit_{state.session_id}_{selected_index}"
+    return {
+        "subject": f"{prefix}_subject",
+        "body": f"{prefix}_body",
+        "cta": f"{prefix}_cta",
+        "signature": f"{prefix}_signature",
+    }
+
+
+def _draft_signature(draft: dict[str, Any]) -> str:
+    return "|".join(str(draft.get(field) or "") for field in ("subject", "body", "cta"))
+
+
+def _set_draft_widget_values(
+    state: ProspectAnalysisState, *, selected_index: int
+) -> None:
+    draft = state.outreach_draft or {}
+    keys = _draft_field_keys(state, selected_index)
+    for field_name in ("subject", "body", "cta"):
+        key = keys[field_name]
+        st.session_state[key] = str(draft.get(field_name) or "")
+    st.session_state[keys["signature"]] = _draft_signature(draft)
+
+
+def _sync_draft_from_widgets(
+    state: ProspectAnalysisState, *, selected_index: int
+) -> None:
+    keys = _draft_field_keys(state, selected_index)
+    draft = dict(state.outreach_draft or {})
+    for field_name in ("subject", "body", "cta"):
+        key = keys[field_name]
+        draft[field_name] = str(st.session_state.get(key) or "")
+    state.outreach_draft = draft
+    st.session_state[keys["signature"]] = _draft_signature(draft)
+    st.session_state["prospect_state"] = state
+
+
 def _decision_success(metric_key: str) -> None:
     if metric_key in st.session_state["prospect_local_metrics"]:
         st.session_state["prospect_local_metrics"][metric_key] += 1
@@ -1969,22 +2058,27 @@ def _generate_draft(
 
 def _render_draft_fields(state: ProspectAnalysisState, *, selected_index: int) -> None:
     draft = state.outreach_draft or {}
+    keys = _draft_field_keys(state, selected_index)
+    current_signature = _draft_signature(draft)
+    if st.session_state.get(keys["signature"]) != current_signature:
+        _set_draft_widget_values(state, selected_index=selected_index)
+    else:
+        for field_name in ("subject", "body", "cta"):
+            st.session_state.setdefault(keys[field_name], str(draft.get(field_name) or ""))
     st.text_input(
-        "Subject",
-        value=draft.get("subject", ""),
-        disabled=True,
+        "Email title / subject",
+        key=keys["subject"],
     )
     st.text_area(
         "Body",
-        value=draft.get("body", ""),
+        key=keys["body"],
         height=230,
-        disabled=True,
     )
     st.text_input(
         "CTA",
-        value=draft.get("cta", ""),
-        disabled=True,
+        key=keys["cta"],
     )
+    _sync_draft_from_widgets(state, selected_index=selected_index)
 
 
 def _draft_recipient_key(state: ProspectAnalysisState, selected_index: int) -> str:
@@ -2029,10 +2123,15 @@ def _render_draft_step(
     selected_index, card = _render_new_card_selector(state, key_suffix="draft")
     if card is None or selected_index is None:
         return
-    if not _has_draft(state):
-        st.info("Generating the first outreach draft for this prospect.")
-        with st.spinner("Generating one-time email draft..."):
+    if st.button(
+        "Generate with AI",
+        type="primary",
+        use_container_width=True,
+        key=f"generate_ai_draft_{state.session_id}_{selected_index}",
+    ):
+        with st.spinner("Generating email draft..."):
             _generate_draft(settings, state, card)
+            _set_draft_widget_values(state, selected_index=selected_index)
         st.rerun()
 
     _render_draft_fields(state, selected_index=selected_index)
@@ -2085,6 +2184,7 @@ def _render_draft_step(
     ):
         with st.spinner("Regenerating draft..."):
             _generate_draft(settings, state, card, instruction=regenerate_instruction)
+            _set_draft_widget_values(state, selected_index=selected_index)
         st.rerun()
 
 
@@ -2231,21 +2331,39 @@ def _clear_decision_state(state: ProspectAnalysisState) -> None:
     state.human_decision = ""
     state.crm_stage = ""
     state.google_sheet_status = ""
+    state.google_sheet_decision_tab = ""
+    state.google_sheet_decision_row = 0
+    state.google_sheet_decision_range = ""
+
+
+def _remove_saved_decision_row(
+    settings: ProspectSettings, state: ProspectAnalysisState
+) -> Any:
+    return ProspectDecisionHandler(settings).remove_decision_from_sheet(state)
 
 
 def _undo_decision(settings: ProspectSettings, state: ProspectAnalysisState) -> None:
+    removal_result = _remove_saved_decision_row(settings, state)
+    if not removal_result.success:
+        st.session_state["prospect_state"] = state
+        st.session_state["prospect_flash"] = ("error", removal_result.message)
+        _set_workflow_step(5)
+        st.rerun()
+        return
     _decrement_last_decision_metric()
     _clear_decision_state(state)
     step = state.log_step(
-        "Decision reopened in dashboard", stage="decision", url=state.current_url
+        "Decision reopened in dashboard after removing the previous CRM sheet row",
+        stage="decision",
+        url=state.current_url,
     )
     logger = StateJSONLLogger(settings.prospect_log_dir)
     logger.write_step(state, step)
     logger.write_state_snapshot(state)
     st.session_state["prospect_state"] = state
     st.session_state["prospect_flash"] = (
-        "warning",
-        "Decision reopened locally. Existing Google Sheets rows are not removed automatically.",
+        "success",
+        "Decision reopened and the previous CRM sheet row was removed.",
     )
     _set_workflow_step(5)
     st.rerun()
@@ -2262,6 +2380,13 @@ def _run_reanalysis(
         st.warning("Add a re-analysis note before running it.")
         return
     if state.completed_at:
+        removal_result = _remove_saved_decision_row(settings, state)
+        if not removal_result.success:
+            st.session_state["prospect_state"] = state
+            st.session_state["prospect_flash"] = ("error", removal_result.message)
+            _set_workflow_step(5)
+            st.rerun()
+            return
         _decrement_last_decision_metric()
         _clear_decision_state(state)
     flow = ProspectFlow(settings, get_prospect_logger(settings.prospect_log_dir))
@@ -2434,6 +2559,8 @@ def main() -> None:
     else:
         st.markdown(CSS, unsafe_allow_html=True)
     _init_session()
+    _install_refresh_reset_detector()
+    _handle_refresh_reset_query()
     _sync_step_from_query_params()
     _sync_active_run_from_registry()
     _render_header()
