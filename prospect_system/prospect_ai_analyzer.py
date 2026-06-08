@@ -54,6 +54,14 @@ def _clean_text(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
 
 
+def _clean_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [_clean_text(item) for item in value if _clean_text(item)]
+    if isinstance(value, str):
+        return [_clean_text(part) for part in value.split(";") if _clean_text(part)]
+    return []
+
+
 def _remove_dash_punctuation(value: str) -> str:
     text = str(value or "")
     text = re.sub(r"(?m)^\s*[-\u2010-\u2015\u2212]\s+", "", text)

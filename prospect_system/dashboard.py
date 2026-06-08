@@ -1842,13 +1842,14 @@ def _render_input_step(settings: ProspectSettings) -> None:
     st.info(
         "Enter one website, define the matching criteria, then start the AI analysis."
     )
-    if st.button(
-        RUN_BUTTON_LABEL,
-        type="primary",
-        use_container_width=True,
-        disabled=bool(st.session_state.get("prospect_analysis_running", False)),
-    ):
-        _start_analysis(settings)
+    with st.container(key="start_prospect_analysis_action"):
+        if st.button(
+            RUN_BUTTON_LABEL,
+            type="primary",
+            use_container_width=True,
+            disabled=bool(st.session_state.get("prospect_analysis_running", False)),
+        ):
+            _start_analysis(settings)
 
 
 def _render_processing_step(
@@ -1879,13 +1880,14 @@ def _render_processing_step(
         _show_blocked_public_cloud_message(state, blocked_error)
         cols = st.columns(2)
         with cols[0]:
-            if st.button(
-                "Run with cached demo content",
-                type="primary",
-                use_container_width=True,
-                key="blocked_cached_demo",
-            ):
-                _start_cached_demo_analysis(settings, state)
+            with st.container(key="cached_demo_blocked_action"):
+                if st.button(
+                    "Run with cached demo content",
+                    type="primary",
+                    use_container_width=True,
+                    key="blocked_cached_demo",
+                ):
+                    _start_cached_demo_analysis(settings, state)
         with cols[1]:
             _step_button("Go back to Criteria", 1, key="blocked_back_to_inputs")
         _render_scrape_explainability(state)
@@ -1898,12 +1900,13 @@ def _render_processing_step(
         with cols[0]:
             _step_button("Go back to Criteria", 1, key="processing_error_back")
         with cols[1]:
-            if st.button(
-                "Run with cached demo content",
-                use_container_width=True,
-                key="processing_error_cached_demo",
-            ):
-                _start_cached_demo_analysis(settings, state)
+            with st.container(key="cached_demo_error_action"):
+                if st.button(
+                    "Run with cached demo content",
+                    use_container_width=True,
+                    key="processing_error_cached_demo",
+                ):
+                    _start_cached_demo_analysis(settings, state)
         if isinstance(state, ProspectAnalysisState):
             _render_scrape_explainability(state)
         if isinstance(state, ProspectAnalysisState) and state.ai_step_logs:

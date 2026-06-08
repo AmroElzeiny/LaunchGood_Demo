@@ -223,6 +223,41 @@ def test_invalid_string_evidence_is_not_treated_as_valid() -> None:
     assert card.field_evidence_map == {}
 
 
+def test_ai_evidence_validation_handles_list_fields(monkeypatch, tmp_path: Path) -> None:
+    _set_required_env(monkeypatch)
+    settings = load_prospect_settings(tmp_path)
+    analyzer = ProspectFlow(settings, logging.getLogger("test-prospect-flow")).ai
+    state = ProspectAnalysisState.create(
+        input_urls=["https://example.test/"],
+        target_criteria="education",
+        outreach_goal="partnership",
+    )
+    state.add_scraped_page(
+        ScrapedPage(
+            url="https://example.test/",
+            final_url="https://example.test/",
+            title="Example",
+            text="Example page text",
+        )
+    )
+
+    validated = analyzer._attach_validated_evidence(
+        {
+            "category": "Education",
+            "target_audience": "Families",
+            "signals_of_fit": ["education program", "family services"],
+            "evidence_snippets": [],
+            "field_evidence_map": {},
+        },
+        evidence_chunks=[],
+        state=state,
+        website="https://example.test/",
+    )
+
+    assert "signals_of_fit" in validated["weak_evidence_fields"]
+    assert "target_audience" in validated["weak_evidence_fields"]
+
+
 def test_prospect_card_sheet_row_contains_decision_and_draft() -> None:
     card = ProspectCard(
         company="Acme",

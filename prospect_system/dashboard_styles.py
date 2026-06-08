@@ -54,7 +54,23 @@ div.stDownloadButton > button:hover,
 div.stButton > button[kind="primary"] {
     background-color: rgba(37, 99, 235, 0.78) !important;
     border-color: rgba(37, 99, 235, 0.82) !important;
-    color: #ffffff !important;
+    color: #f8fafc !important;
+    -webkit-text-fill-color: #f8fafc !important;
+}
+div.stButton > button[kind="primary"] *,
+div.stButton > button[data-testid="baseButton-primary"] *,
+div.stButton > button[data-testid="baseButton-primary"] {
+    color: #f8fafc !important;
+    -webkit-text-fill-color: #f8fafc !important;
+}
+.st-key-start_prospect_analysis_action button,
+.st-key-start_prospect_analysis_action button *,
+.st-key-cached_demo_blocked_action button,
+.st-key-cached_demo_blocked_action button *,
+.st-key-cached_demo_error_action button,
+.st-key-cached_demo_error_action button * {
+    color: #f8fafc !important;
+    -webkit-text-fill-color: #f8fafc !important;
 }
 div.stButton > button:disabled,
 div.stDownloadButton > button:disabled {
