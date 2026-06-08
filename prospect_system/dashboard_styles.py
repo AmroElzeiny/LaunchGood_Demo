@@ -3,7 +3,6 @@ from __future__ import annotations
 import html
 from typing import Any
 
-
 PAGE_TITLE = "AI Prospect Discovery CRM"
 RUN_BUTTON_LABEL = "Start Prospect Analysis"
 DEMO_BUTTON_LABEL = "Please Insert a Demo Link"
@@ -36,6 +35,32 @@ input:disabled {
     padding-top: 1.4rem;
     padding-bottom: 2rem;
     max-width: 1320px;
+}
+div.stButton > button,
+div.stDownloadButton > button,
+[data-testid="stLinkButton"] > a {
+    background-color: rgba(44, 98, 138, 0.10) !important;
+    border-color: rgba(44, 98, 138, 0.34) !important;
+    color: #2c628a !important;
+    box-shadow: none !important;
+}
+div.stButton > button:hover,
+div.stDownloadButton > button:hover,
+[data-testid="stLinkButton"] > a:hover {
+    background-color: rgba(37, 99, 235, 0.15) !important;
+    border-color: rgba(37, 99, 235, 0.48) !important;
+    color: #1d4ed8 !important;
+}
+div.stButton > button[kind="primary"] {
+    background-color: rgba(37, 99, 235, 0.78) !important;
+    border-color: rgba(37, 99, 235, 0.82) !important;
+    color: #ffffff !important;
+}
+div.stButton > button:disabled,
+div.stDownloadButton > button:disabled {
+    background-color: rgba(148, 163, 184, 0.16) !important;
+    border-color: rgba(148, 163, 184, 0.24) !important;
+    color: rgba(44, 98, 138, 0.62) !important;
 }
 h1, h2, h3 {
     letter-spacing: 0;
@@ -384,15 +409,12 @@ def prospect_card_html(card: Any) -> str:
         ("Contact Email", card.contact_email or "Not detected"),
         ("Next Step", card.next_step),
     ]
-    field_html = "\n".join(
-        f"""
+    field_html = "\n".join(f"""
         <div class="field-block">
             <div class="field-label">{html.escape(label)}</div>
             <div class="field-value">{html.escape(str(value or 'Unknown'))}</div>
         </div>
-        """
-        for label, value in fields
-    )
+        """ for label, value in fields)
     return f"""
     <div class="prospect-card">
         <div class="prospect-card-header">

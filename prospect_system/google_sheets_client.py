@@ -10,7 +10,6 @@ from prospect_system.dashboard_state import ProspectAnalysisState, StepLog
 from prospect_system.errors import ErrorRecord, ProspectSheetsError
 from prospect_system.prospect_config import ProspectSettings, SHEET_TABS
 
-
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 
 
@@ -42,20 +41,29 @@ class GoogleSheetsClient:
             service = self._get_service()
             self.ensure_tab_exists(tab_name)
             row_values = [_cell(value) for value in values]
-            response = service.spreadsheets().values().append(
-                spreadsheetId=self.settings.google_sheet_id,
-                range=f"'{tab_name}'!A:Z",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body={"values": [row_values]},
-            ).execute()
+            response = (
+                service.spreadsheets()
+                .values()
+                .append(
+                    spreadsheetId=self.settings.google_sheet_id,
+                    range=f"'{tab_name}'!A:Z",
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": [row_values]},
+                )
+                .execute()
+            )
             updated_range = str(response.get("updates", {}).get("updatedRange") or "")
-            self._clear_updated_row_background(tab_name, updated_range, column_count=len(row_values))
+            self._clear_updated_row_background(
+                tab_name, updated_range, column_count=len(row_values)
+            )
             return SheetAppendResult(True, f"Saved to Google Sheets tab: {tab_name}")
         except Exception as exc:  # noqa: BLE001
             return SheetAppendResult(False, f"Google Sheets API failure: {exc}")
 
-    def append_step(self, state: ProspectAnalysisState, step: StepLog) -> SheetAppendResult:
+    def append_step(
+        self, state: ProspectAnalysisState, step: StepLog
+    ) -> SheetAppendResult:
         return self.append_row(SHEET_TABS["logs"], step.to_row(state.session_id))
 
     def append_error(self, error: ErrorRecord) -> SheetAppendResult:
@@ -109,10 +117,14 @@ class GoogleSheetsClient:
 
     def _load_sheet_metadata(self) -> None:
         service = self._get_service()
-        metadata = service.spreadsheets().get(
-            spreadsheetId=self.settings.google_sheet_id,
-            fields="sheets.properties(sheetId,title)",
-        ).execute()
+        metadata = (
+            service.spreadsheets()
+            .get(
+                spreadsheetId=self.settings.google_sheet_id,
+                fields="sheets.properties(sheetId,title)",
+            )
+            .execute()
+        )
         sheet_ids: dict[str, int] = {}
         for sheet in metadata.get("sheets", []):
             properties = sheet.get("properties", {})
@@ -123,7 +135,9 @@ class GoogleSheetsClient:
         self._sheet_ids = sheet_ids
         self._known_tabs = set(sheet_ids)
 
-    def _clear_updated_row_background(self, tab_name: str, updated_range: str, *, column_count: int) -> None:
+    def _clear_updated_row_background(
+        self, tab_name: str, updated_range: str, *, column_count: int
+    ) -> None:
         row_number = self._row_number_from_updated_range(updated_range)
         sheet_id = self._sheet_id_for_tab(tab_name)
         if row_number is None or sheet_id is None:
@@ -178,7 +192,10 @@ class GoogleSheetsClient:
         def is_header_row(row: list[Any]) -> bool:
             first_cell = str(row[0]).strip().lower() if row else ""
             second_cell = str(row[1]).strip().lower() if len(row) > 1 else ""
-            return first_cell in {"created_at", "created at"} or second_cell in {"website_url", "website url"}
+            return first_cell in {"created_at", "created at"} or second_cell in {
+                "website_url",
+                "website url",
+            }
 
         approved_rows = [row for row in approved if not is_header_row(row)]
         rejected_rows = [row for row in rejected if not is_header_row(row)]
@@ -194,7 +211,9 @@ class GoogleSheetsClient:
                 pass
             try:
                 if str(row[11]).strip():
-                    uncertainty_count += len([part for part in str(row[11]).split(";") if part.strip()])
+                    uncertainty_count += len(
+                        [part for part in str(row[11]).split(";") if part.strip()]
+                    )
             except IndexError:
                 pass
             try:
@@ -215,10 +234,15 @@ class GoogleSheetsClient:
 
     def _read_tab(self, tab_name: str) -> list[list[Any]]:
         service = self._get_service()
-        result = service.spreadsheets().values().get(
-            spreadsheetId=self.settings.google_sheet_id,
-            range=f"'{tab_name}'!A:Z",
-        ).execute()
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=self.settings.google_sheet_id,
+                range=f"'{tab_name}'!A:Z",
+            )
+            .execute()
+        )
         return list(result.get("values", []))
 
     def _get_service(self) -> Any:
@@ -232,10 +256,14 @@ class GoogleSheetsClient:
                 "Google API packages are missing. Install google-api-python-client and google-auth."
             ) from exc
         credentials = self._load_credentials(service_account, scopes=[SHEETS_SCOPE])
-        self._service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
+        self._service = build(
+            "sheets", "v4", credentials=credentials, cache_discovery=False
+        )
         return self._service
 
-    def _load_credentials(self, service_account_module: Any, *, scopes: list[str]) -> Any:
+    def _load_credentials(
+        self, service_account_module: Any, *, scopes: list[str]
+    ) -> Any:
         env_json_error = ""
         if self.settings.google_service_account_json:
             try:
@@ -243,12 +271,20 @@ class GoogleSheetsClient:
             except json.JSONDecodeError as exc:
                 env_json_error = f"GOOGLE_SERVICE_ACCOUNT_JSON is invalid JSON: {exc}"
             else:
-                return service_account_module.Credentials.from_service_account_info(info, scopes=scopes)
+                return service_account_module.Credentials.from_service_account_info(
+                    info, scopes=scopes
+                )
         path = Path(self.settings.google_service_account_json_path)
         if not path.is_absolute():
             path = self.settings.base_dir / path
         if not path.exists():
             if env_json_error:
-                raise ProspectSheetsError(f"{env_json_error}. Also, Google service account file was not found: {path}")
-            raise ProspectSheetsError(f"Google service account file was not found: {path}")
-        return service_account_module.Credentials.from_service_account_file(str(path), scopes=scopes)
+                raise ProspectSheetsError(
+                    f"{env_json_error}. Also, Google service account file was not found: {path}"
+                )
+            raise ProspectSheetsError(
+                f"Google service account file was not found: {path}"
+            )
+        return service_account_module.Credentials.from_service_account_file(
+            str(path), scopes=scopes
+        )

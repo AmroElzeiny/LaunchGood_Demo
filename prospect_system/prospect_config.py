@@ -8,7 +8,6 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-
 SHEET_TABS = {
     "approved": "Approved CRM",
     "rejected": "Rejected",
@@ -31,7 +30,10 @@ REQUIRED_ENV_NAMES = (
     "PROSPECT_MANUAL_REVIEW_MINUTES",
 )
 
-GOOGLE_CREDENTIAL_ENV_GROUP = ("GOOGLE_SERVICE_ACCOUNT_JSON_PATH", "GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_CREDENTIAL_ENV_GROUP = (
+    "GOOGLE_SERVICE_ACCOUNT_JSON_PATH",
+    "GOOGLE_SERVICE_ACCOUNT_JSON",
+)
 AI_CREDENTIAL_ENV_GROUP = ("OPENAI_API_KEY",)
 SMTP_CREDENTIAL_ENV_GROUP = ("SMTP_PASSWORD",)
 SUPPORTED_EMAIL_SEND_METHODS = {"smtp", "gmail_api"}
@@ -74,13 +76,16 @@ class ProspectSettings:
     prospect_enable_browser_fetch: bool = False
     enable_site_profiles: bool = True
     openai_request_timeout_seconds: float = 45.0
+    analysis_timeout_seconds: float = 90.0
     ai_retry_budget: int = 2
     ai_backoff_base_seconds: float = 1.5
     network_retry_budget: int = 1
     network_backoff_base_seconds: float = 1.5
     browser_reprobe_cooldown_seconds: int = 600
     max_fetch_strategies_per_url: int = 4
-    prospect_log_dir: Path = field(default_factory=lambda: Path("state") / "prospect_logs")
+    prospect_log_dir: Path = field(
+        default_factory=lambda: Path("state") / "prospect_logs"
+    )
     missing_env_values: list[str] = field(default_factory=list)
 
     @property
@@ -105,7 +110,9 @@ class ProspectSettings:
     @property
     def email_sender_email(self) -> str:
         if self.email_send_method == "smtp":
-            return self.smtp_sender_email or self.gmail_sender_email or self.smtp_username
+            return (
+                self.smtp_sender_email or self.gmail_sender_email or self.smtp_username
+            )
         return self.gmail_sender_email
 
     @property
@@ -177,7 +184,9 @@ def _fit_status_rules_from_env() -> list[dict[str, Any]]:
 
 def _is_placeholder(value: str) -> bool:
     normalized = str(value or "").strip().upper()
-    return not normalized or normalized.startswith("YOUR_") or normalized.endswith("_HERE")
+    return (
+        not normalized or normalized.startswith("YOUR_") or normalized.endswith("_HERE")
+    )
 
 
 def _has_valid_json(value: str) -> bool:
@@ -191,8 +200,13 @@ def _has_valid_json(value: str) -> bool:
 
 
 def _missing_env_values(base_dir: Path | None = None) -> list[str]:
-    missing = [name for name in REQUIRED_ENV_NAMES if _is_placeholder(os.getenv(name, ""))]
-    method = os.getenv("PROSPECT_EMAIL_SEND_METHOD", "gmail_api").strip().lower() or "gmail_api"
+    missing = [
+        name for name in REQUIRED_ENV_NAMES if _is_placeholder(os.getenv(name, ""))
+    ]
+    method = (
+        os.getenv("PROSPECT_EMAIL_SEND_METHOD", "gmail_api").strip().lower()
+        or "gmail_api"
+    )
     if method not in SUPPORTED_EMAIL_SEND_METHODS:
         missing.append("PROSPECT_EMAIL_SEND_METHOD must be smtp or gmail_api")
     if method == "smtp":
@@ -201,7 +215,10 @@ def _missing_env_values(base_dir: Path | None = None) -> list[str]:
                 missing.append(name)
         if _is_placeholder(os.getenv("SMTP_PASSWORD", "")):
             missing.append("SMTP_PASSWORD")
-        if not (os.getenv("SMTP_SENDER_EMAIL", "").strip() or os.getenv("GMAIL_SENDER_EMAIL", "").strip()):
+        if not (
+            os.getenv("SMTP_SENDER_EMAIL", "").strip()
+            or os.getenv("GMAIL_SENDER_EMAIL", "").strip()
+        ):
             missing.append("SMTP_SENDER_EMAIL or GMAIL_SENDER_EMAIL")
     service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     service_account_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_PATH", "").strip()
@@ -215,9 +232,13 @@ def _missing_env_values(base_dir: Path | None = None) -> list[str]:
             path = base_dir / path
         has_json_path = path.exists()
         if not has_env_json and not has_json_path:
-            missing.append(f"GOOGLE_SERVICE_ACCOUNT_JSON_PATH file not found: {service_account_path}")
+            missing.append(
+                f"GOOGLE_SERVICE_ACCOUNT_JSON_PATH file not found: {service_account_path}"
+            )
     if not has_env_json and not has_json_path:
-        missing.append("GOOGLE_SERVICE_ACCOUNT_JSON_PATH or GOOGLE_SERVICE_ACCOUNT_JSON")
+        missing.append(
+            "GOOGLE_SERVICE_ACCOUNT_JSON_PATH or GOOGLE_SERVICE_ACCOUNT_JSON"
+        )
     if not any(os.getenv(name, "").strip() for name in AI_CREDENTIAL_ENV_GROUP):
         missing.append("OPENAI_API_KEY")
     if not _fit_status_rules_from_env():
@@ -230,23 +251,38 @@ def load_prospect_settings(cwd: Path | None = None) -> ProspectSettings:
     load_dotenv(base_dir / ".env")
     max_pages_to_scrape = max(1, _parse_int("PROSPECT_MAX_PAGES_TO_SCRAPE", 1))
     timeout_seconds = max(1, _parse_int("SCRAPING_TIMEOUT_SECONDS", 30))
-    prospect_log_dir = Path(os.getenv("PROSPECT_LOG_DIR", str(base_dir / "state" / "prospect_logs")))
-    email_send_method = os.getenv("PROSPECT_EMAIL_SEND_METHOD", "gmail_api").strip().lower() or "gmail_api"
+    prospect_log_dir = Path(
+        os.getenv("PROSPECT_LOG_DIR", str(base_dir / "state" / "prospect_logs"))
+    )
+    email_send_method = (
+        os.getenv("PROSPECT_EMAIL_SEND_METHOD", "gmail_api").strip().lower()
+        or "gmail_api"
+    )
     if email_send_method not in SUPPORTED_EMAIL_SEND_METHODS:
         email_send_method = "gmail_api"
     return ProspectSettings(
         base_dir=base_dir,
         demo_website_url=os.getenv("PROSPECT_DEMO_WEBSITE_URL", "").strip(),
-        default_target_criteria=os.getenv("PROSPECT_DEFAULT_TARGET_CRITERIA", "").strip(),
+        default_target_criteria=os.getenv(
+            "PROSPECT_DEFAULT_TARGET_CRITERIA", ""
+        ).strip(),
         default_outreach_goal=os.getenv("PROSPECT_DEFAULT_OUTREACH_GOAL", "").strip(),
         max_pages_to_scrape=max_pages_to_scrape,
         google_sheet_id=os.getenv("GOOGLE_SHEET_ID", "").strip(),
-        google_service_account_json_path=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_PATH", "").strip(),
-        google_service_account_json=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip(),
-        google_service_account_email=os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL", "").strip(),
+        google_service_account_json_path=os.getenv(
+            "GOOGLE_SERVICE_ACCOUNT_JSON_PATH", ""
+        ).strip(),
+        google_service_account_json=os.getenv(
+            "GOOGLE_SERVICE_ACCOUNT_JSON", ""
+        ).strip(),
+        google_service_account_email=os.getenv(
+            "GOOGLE_SERVICE_ACCOUNT_EMAIL", ""
+        ).strip(),
         gmail_sender_email=os.getenv("GMAIL_SENDER_EMAIL", "").strip(),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
-        prospect_usage_notify_chat_id=os.getenv("PROSPECT_USAGE_NOTIFY_CHAT_ID", "100000001").strip(),
+        prospect_usage_notify_chat_id=os.getenv(
+            "PROSPECT_USAGE_NOTIFY_CHAT_ID", "100000001"
+        ).strip(),
         email_send_method=email_send_method,
         smtp_host=os.getenv("SMTP_HOST", "").strip(),
         smtp_port=max(0, _parse_int("SMTP_PORT", 587)),
@@ -260,22 +296,41 @@ def load_prospect_settings(cwd: Path | None = None) -> ProspectSettings:
         ai_model=os.getenv("AI_MODEL", os.getenv("OPENAI_MODEL", "")).strip(),
         scraping_timeout_seconds=timeout_seconds,
         captcha_end_message=os.getenv("CAPTCHA_END_MESSAGE", "").strip(),
-        manual_review_minutes=max(0.1, _parse_float("PROSPECT_MANUAL_REVIEW_MINUTES", 10.0)),
+        manual_review_minutes=max(
+            0.1, _parse_float("PROSPECT_MANUAL_REVIEW_MINUTES", 10.0)
+        ),
         log_refresh_seconds=max(0.5, _parse_float("PROSPECT_LOG_REFRESH_SECONDS", 3.0)),
         fit_status_rules=_fit_status_rules_from_env(),
         verify_ssl=_parse_bool(os.getenv("VERIFY_SSL"), default=True),
         headless_browser=_parse_bool(os.getenv("HEADLESS_BROWSER"), default=True),
-        use_scrapling_cloudflare_solver=_parse_bool(os.getenv("USE_SCRAPLING_CLOUDFLARE_SOLVER"), default=False),
+        use_scrapling_cloudflare_solver=_parse_bool(
+            os.getenv("USE_SCRAPLING_CLOUDFLARE_SOLVER"), default=False
+        ),
         enable_browser_tabs=_parse_bool(os.getenv("ENABLE_BROWSER_TABS"), default=True),
-        prospect_enable_browser_fetch=_parse_bool(os.getenv("PROSPECT_ENABLE_BROWSER_FETCH"), default=False),
-        enable_site_profiles=_parse_bool(os.getenv("ENABLE_SITE_PROFILES"), default=True),
-        openai_request_timeout_seconds=max(5.0, _parse_float("OPENAI_REQUEST_TIMEOUT_SECONDS", 45.0)),
+        prospect_enable_browser_fetch=_parse_bool(
+            os.getenv("PROSPECT_ENABLE_BROWSER_FETCH"), default=False
+        ),
+        enable_site_profiles=_parse_bool(
+            os.getenv("ENABLE_SITE_PROFILES"), default=True
+        ),
+        openai_request_timeout_seconds=max(
+            5.0, _parse_float("OPENAI_REQUEST_TIMEOUT_SECONDS", 45.0)
+        ),
+        analysis_timeout_seconds=max(
+            5.0, _parse_float("PROSPECT_ANALYSIS_TIMEOUT_SECONDS", 90.0)
+        ),
         ai_retry_budget=max(0, _parse_int("AI_RETRY_BUDGET", 2)),
         ai_backoff_base_seconds=max(0.1, _parse_float("AI_BACKOFF_BASE_SECONDS", 1.5)),
         network_retry_budget=max(0, _parse_int("NETWORK_RETRY_BUDGET", 1)),
-        network_backoff_base_seconds=max(0.1, _parse_float("NETWORK_BACKOFF_BASE_SECONDS", 1.5)),
-        browser_reprobe_cooldown_seconds=max(30, _parse_int("BROWSER_REPROBE_COOLDOWN_SECONDS", 600)),
-        max_fetch_strategies_per_url=max(1, _parse_int("MAX_FETCH_STRATEGIES_PER_URL", 4)),
+        network_backoff_base_seconds=max(
+            0.1, _parse_float("NETWORK_BACKOFF_BASE_SECONDS", 1.5)
+        ),
+        browser_reprobe_cooldown_seconds=max(
+            30, _parse_int("BROWSER_REPROBE_COOLDOWN_SECONDS", 600)
+        ),
+        max_fetch_strategies_per_url=max(
+            1, _parse_int("MAX_FETCH_STRATEGIES_PER_URL", 4)
+        ),
         prospect_log_dir=prospect_log_dir,
         missing_env_values=_missing_env_values(base_dir),
     )

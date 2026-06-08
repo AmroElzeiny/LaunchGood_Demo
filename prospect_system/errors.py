@@ -6,7 +6,9 @@ from typing import Any
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
 
 
 @dataclass(slots=True)
@@ -19,13 +21,19 @@ class ErrorRecord:
     created_at: str = field(default_factory=utc_now_iso)
 
     def to_row(self) -> list[Any]:
+        error_type = str(self.details.get("error_type") or "").strip()
+        error_message = str(
+            self.details.get("error_message") or self.message or ""
+        ).strip()
+        resolved = str(self.details.get("resolved") or "").strip()
         return [
             self.created_at,
             self.session_id,
             self.stage,
             self.url,
-            self.message,
-            self.details,
+            error_type,
+            error_message,
+            resolved,
         ]
 
 

@@ -14,7 +14,6 @@ from typing import Any
 from prospect_system.errors import ProspectGmailError
 from prospect_system.prospect_config import ProspectSettings
 
-
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 
@@ -26,7 +25,13 @@ class GmailSendResult:
 
 
 def _normalize_email_body(body: str) -> str:
-    cleaned = str(body or "").strip().replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = (
+        str(body or "")
+        .strip()
+        .replace("\\n", "\n")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned
 
@@ -36,7 +41,9 @@ class GmailClient:
         self.settings = settings
         self._service: Any | None = None
 
-    def send_email(self, *, recipient_email: str, subject: str, body: str) -> GmailSendResult:
+    def send_email(
+        self, *, recipient_email: str, subject: str, body: str
+    ) -> GmailSendResult:
         recipient_email = recipient_email.strip()
         if not recipient_email:
             return GmailSendResult(False, "Recipient email is required.")
@@ -47,21 +54,31 @@ class GmailClient:
                 body=_normalize_email_body(body),
             )
         if self.settings.email_send_method != "gmail_api":
-            return GmailSendResult(False, "PROSPECT_EMAIL_SEND_METHOD must be smtp or gmail_api.")
+            return GmailSendResult(
+                False, "PROSPECT_EMAIL_SEND_METHOD must be smtp or gmail_api."
+            )
         if not self.settings.gmail_sender_email:
             return GmailSendResult(False, "GMAIL_SENDER_EMAIL is missing from .env.")
         if not self.settings.is_google_configured:
-            return GmailSendResult(False, "Google service account credentials are not configured in .env.")
+            return GmailSendResult(
+                False, "Google service account credentials are not configured in .env."
+            )
         try:
             message = MIMEText(_normalize_email_body(body), "plain", "utf-8")
             message["To"] = recipient_email
             message["From"] = self.settings.gmail_sender_email
             message["Subject"] = subject
             raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-            response = self._get_service().users().messages().send(
-                userId="me",
-                body={"raw": raw},
-            ).execute()
+            response = (
+                self._get_service()
+                .users()
+                .messages()
+                .send(
+                    userId="me",
+                    body={"raw": raw},
+                )
+                .execute()
+            )
             return GmailSendResult(
                 True,
                 "Email sent successfully.",
@@ -70,7 +87,9 @@ class GmailClient:
         except Exception as exc:  # noqa: BLE001
             return GmailSendResult(False, f"Gmail API failure: {exc}")
 
-    def _send_email_with_smtp(self, *, recipient_email: str, subject: str, body: str) -> GmailSendResult:
+    def _send_email_with_smtp(
+        self, *, recipient_email: str, subject: str, body: str
+    ) -> GmailSendResult:
         if not self.settings.is_smtp_configured:
             return GmailSendResult(
                 False,
@@ -90,7 +109,9 @@ class GmailClient:
                     timeout=self.settings.smtp_timeout_seconds,
                     context=context,
                 ) as server:
-                    server.login(self.settings.smtp_username, self.settings.smtp_password)
+                    server.login(
+                        self.settings.smtp_username, self.settings.smtp_password
+                    )
                     server.send_message(message)
             else:
                 with smtplib.SMTP(
@@ -100,7 +121,9 @@ class GmailClient:
                 ) as server:
                     if self.settings.smtp_use_tls:
                         server.starttls(context=context)
-                    server.login(self.settings.smtp_username, self.settings.smtp_password)
+                    server.login(
+                        self.settings.smtp_username, self.settings.smtp_password
+                    )
                     server.send_message(message)
             return GmailSendResult(True, "Email sent successfully via SMTP.")
         except Exception as exc:  # noqa: BLE001
@@ -119,10 +142,14 @@ class GmailClient:
         credentials = self._load_credentials(service_account, scopes=[GMAIL_SEND_SCOPE])
         if self.settings.gmail_sender_email:
             credentials = credentials.with_subject(self.settings.gmail_sender_email)
-        self._service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+        self._service = build(
+            "gmail", "v1", credentials=credentials, cache_discovery=False
+        )
         return self._service
 
-    def _load_credentials(self, service_account_module: Any, *, scopes: list[str]) -> Any:
+    def _load_credentials(
+        self, service_account_module: Any, *, scopes: list[str]
+    ) -> Any:
         env_json_error = ""
         if self.settings.google_service_account_json:
             try:
@@ -130,12 +157,20 @@ class GmailClient:
             except json.JSONDecodeError as exc:
                 env_json_error = f"GOOGLE_SERVICE_ACCOUNT_JSON is invalid JSON: {exc}"
             else:
-                return service_account_module.Credentials.from_service_account_info(info, scopes=scopes)
+                return service_account_module.Credentials.from_service_account_info(
+                    info, scopes=scopes
+                )
         path = Path(self.settings.google_service_account_json_path)
         if not path.is_absolute():
             path = self.settings.base_dir / path
         if not path.exists():
             if env_json_error:
-                raise ProspectGmailError(f"{env_json_error}. Also, Google service account file was not found: {path}")
-            raise ProspectGmailError(f"Google service account file was not found: {path}")
-        return service_account_module.Credentials.from_service_account_file(str(path), scopes=scopes)
+                raise ProspectGmailError(
+                    f"{env_json_error}. Also, Google service account file was not found: {path}"
+                )
+            raise ProspectGmailError(
+                f"Google service account file was not found: {path}"
+            )
+        return service_account_module.Credentials.from_service_account_file(
+            str(path), scopes=scopes
+        )

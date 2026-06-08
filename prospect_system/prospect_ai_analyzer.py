@@ -4,6 +4,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -11,11 +12,25 @@ from openai import OpenAI
 
 from job_bot.openai_compat import create_chat_completion_with_fallback
 
-from dashboard_state import ProspectAnalysisState, ScrapedPage
-from errors import ProspectAIError
-from prospect_card import ProspectCard
-from prospect_config import ProspectSettings
-from prospect_scraper import extract_contact_email
+try:
+    from prospect_system.dashboard_state import (
+        EvidenceChunk,
+        ProspectAnalysisState,
+        ScrapedPage,
+    )
+
+    from prospect_system.errors import ProspectAIError
+    from prospect_system.prospect_card import EvidenceSnippet, ProspectCard
+    from prospect_system.prospect_config import ProspectSettings
+    from prospect_system.prospect_scraper import extract_contact_email
+except ImportError:  # pragma: no cover - direct script execution fallback
+    from dashboard_state import EvidenceChunk, ProspectAnalysisState, ScrapedPage
+
+    from errors import ProspectAIError
+    from prospect_card import EvidenceSnippet, ProspectCard
+
+    from prospect_config import ProspectSettings
+    from prospect_scraper import extract_contact_email
 
 
 def _safe_json_loads(text: str) -> dict[str, Any]:
@@ -63,7 +78,9 @@ def _format_email_body(value: Any) -> str:
     body = re.sub(r"</p>\s*<p[^>]*>", "\n\n", body, flags=re.IGNORECASE)
     body = re.sub(r"</?p[^>]*>", "", body, flags=re.IGNORECASE)
     if "\n" not in body:
-        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", body) if part.strip()]
+        sentences = [
+            part.strip() for part in re.split(r"(?<=[.!?])\s+", body) if part.strip()
+        ]
         if len(sentences) >= 3:
             paragraphs: list[str] = []
             first = sentences[0]
@@ -89,7 +106,60 @@ def _same_site(url_a: str, url_b: str) -> bool:
     host_b = _host(url_b)
     if not host_a or not host_b:
         return False
-    return host_a == host_b or host_a.endswith("." + host_b) or host_b.endswith("." + host_a)
+    return (
+        host_a == host_b
+        or host_a.endswith("." + host_b)
+        or host_b.endswith("." + host_a)
+    )
+
+
+def _normalize_for_evidence_match(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+
+def _very_close_quote_match(quote: str, text: str) -> bool:
+    quote_norm = _normalize_for_evidence_match(quote)
+    text_norm = _normalize_for_evidence_match(text)
+    if not quote_norm or not text_norm:
+        return False
+    if quote_norm in text_norm:
+        return True
+    quote_words = quote_norm.split()
+    text_words = text_norm.split()
+    if len(quote_words) < 5 or len(text_words) < len(quote_words):
+        return False
+    window_size = min(len(text_words), max(len(quote_words) + 4, len(quote_words)))
+    step = max(1, len(quote_words) // 3)
+    for start in range(0, min(len(text_words), 2500), step):
+        window = " ".join(text_words[start : start + window_size])
+        if not window:
+            continue
+        if SequenceMatcher(None, quote_norm, window).ratio() >= 0.86:
+            return True
+        if start + window_size >= len(text_words):
+            break
+    return False
+
+
+def _normalize_supports_field(value: Any) -> str:
+    field_name = _clean_text(value).lower().replace(" ", "_")
+    aliases = {
+        "audience": "target_audience",
+        "what_the_organization_does": "what_they_do",
+        "services_or_products": "services_products",
+        "risk_or_uncertainty_flags": "risk_uncertainty_flags",
+        "recommended_next_action": "recommended_action",
+        "possible_collaboration_angle": "outreach_angle",
+        "fit_signals": "signals_of_fit",
+    }
+    return aliases.get(field_name, field_name)
+
+
+def _safe_structural_score(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 @dataclass(slots=True)
@@ -101,11 +171,78 @@ class InformationDecision:
     confidence: float = 0.0
 
 
+@dataclass(slots=True)
+class RankedInternalLink:
+    url: str
+    priority: int
+    reason: str
+    expected_information: str
+    confidence: float
+
+
+@dataclass(slots=True)
+class LinkRankingDecision:
+    ranked_links: list[RankedInternalLink] = field(default_factory=list)
+    homepage_enough: bool = False
+    reason_homepage_enough: str = ""
+    recommended_next_action: str = "scrape_more_pages"
+
+
 class ProspectAIAnalyzer:
     def __init__(self, settings: ProspectSettings, logger: logging.Logger) -> None:
         self.settings = settings
         self.logger = logger
-        self.client = OpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
+        self.client = (
+            OpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
+        )
+
+    def build_evidence_chunks(
+        self,
+        state: ProspectAnalysisState,
+        *,
+        website: str,
+        chunk_size: int = 850,
+        overlap: int = 80,
+    ) -> list[EvidenceChunk]:
+        chunks: list[EvidenceChunk] = []
+        chunk_index = 1
+        for page in self._pages_for_site(state, website):
+            text = str(page.text or "").strip()
+            if not text:
+                continue
+            text = re.sub(r"\n{3,}", "\n\n", text)
+            cursor = 0
+            while cursor < len(text):
+                end = min(len(text), cursor + max(300, chunk_size))
+                if end < len(text):
+                    boundary_candidates = [
+                        text.rfind("\n\n", cursor + 450, end),
+                        text.rfind(". ", cursor + 450, end),
+                        text.rfind("! ", cursor + 450, end),
+                        text.rfind("? ", cursor + 450, end),
+                    ]
+                    boundary = max(boundary_candidates)
+                    if boundary > cursor:
+                        end = min(len(text), boundary + 1)
+                chunk_text = _clean_text(text[cursor:end])
+                if len(chunk_text) >= 80:
+                    chunks.append(
+                        EvidenceChunk(
+                            chunk_id=f"chunk_{chunk_index:03d}",
+                            page_url=page.final_url or page.url,
+                            page_title=page.title,
+                            text=chunk_text,
+                            start_index=cursor,
+                            end_index=end,
+                        )
+                    )
+                    chunk_index += 1
+                if end >= len(text):
+                    break
+                cursor = max(end - max(0, overlap), cursor + 1)
+                if len(chunks) >= 90:
+                    return chunks
+        return chunks
 
     def assess_information_need(
         self,
@@ -114,91 +251,145 @@ class ProspectAIAnalyzer:
         website: str,
         candidate_links: list[dict[str, Any]],
     ) -> InformationDecision:
+        ranking = self.rank_internal_links(
+            state, website=website, candidate_links=candidate_links
+        )
+        return InformationDecision(
+            enough_information=ranking.homepage_enough,
+            selected_extra_urls=[link.url for link in ranking.ranked_links],
+            reason=ranking.reason_homepage_enough,
+            missing_information=[],
+            confidence=max(
+                [link.confidence for link in ranking.ranked_links], default=0.0
+            ),
+        )
+
+    def rank_internal_links(
+        self,
+        state: ProspectAnalysisState,
+        *,
+        website: str,
+        candidate_links: list[dict[str, Any]],
+    ) -> LinkRankingDecision:
         if self.client is None or not self.settings.ai_model:
-            return self._fallback_information_decision(state, website=website, candidate_links=candidate_links)
-        pages = self._pages_payload(state, website=website, text_limit=3500)
-        remaining_page_budget = max(0, self.settings.max_pages_to_scrape - len(self._pages_for_site(state, website)))
-        visible_candidate_links = candidate_links[:60]
+            return self._fallback_link_ranking(
+                state, website=website, candidate_links=candidate_links
+            )
+        remaining_page_budget = max(
+            0,
+            self.settings.max_pages_to_scrape
+            - len(self._pages_for_site(state, website)),
+        )
+        visible_candidate_links = candidate_links[:80]
         payload = {
             "website": website,
             "target_criteria": state.target_criteria,
             "outreach_goal": state.outreach_goal,
-            "scraped_pages": pages,
+            "scraped_pages": self._pages_payload(
+                state, website=website, text_limit=3500
+            ),
             "candidate_internal_links": visible_candidate_links,
             "max_pages_to_scrape": self.settings.max_pages_to_scrape,
-            "scraped_page_count": len(pages),
+            "scraped_page_count": len(self._pages_for_site(state, website)),
             "remaining_page_budget": remaining_page_budget,
-            "already_scraped_urls": [page.final_url for page in state.scraped_pages if _same_site(page.final_url, website)],
+            "already_scraped_urls": [
+                page.final_url
+                for page in state.scraped_pages
+                if _same_site(page.final_url, website)
+            ],
             "return_format": {
-                "enough_information": "bool",
-                "selected_extra_urls": ["exact_absolute_url_from_candidate_internal_links"],
-                "reason": "short_string",
-                "missing_information": ["string"],
-                "confidence": "float_0_to_1",
+                "ranked_links": [
+                    {
+                        "url": "exact_absolute_url_from_candidate_internal_links",
+                        "priority": "integer_1_is_highest",
+                        "reason": "short_string",
+                        "expected_information": "short_string",
+                        "confidence": "float_0_to_1",
+                    }
+                ],
+                "homepage_enough": "bool",
+                "reason_homepage_enough": "short_string",
+                "recommended_next_action": "scrape_more_pages|create_card",
             },
         }
         system_prompt = (
-            "You are a strict, evidence-based AI prospect discovery analyst deciding whether the currently scraped website "
-            "evidence is sufficient to evaluate prospect fit. Your task is to review scraped_pages, target_criteria, "
-            "outreach_goal, candidate_internal_links, already_scraped_urls, and the scraping limits. Decide whether the "
-            "current evidence is enough to judge the organization's fit, and choose the highest-value remaining internal "
-            "URLs that should be scraped next. Return JSON only. Do not include markdown, comments, explanations outside "
-            "JSON, or extra text. Output must be valid JSON parseable by Python json.loads(), with no trailing commas and "
-            "no null values. Use only the keys listed in return_format: enough_information, selected_extra_urls, reason, "
-            "missing_information, and confidence. "
-            "Core rules: use only the scraped website text and candidate_internal_links provided in the input. Do not use "
-            "outside knowledge, assumptions, web browsing, or invented URLs. Do not approve or reject the prospect; your "
-            "role is only to decide evidence sufficiency and next pages to scrape. Be conservative: vague, generic, thin, "
-            "blocked, duplicated, navigation-heavy, or unclear content is usually not enough for a confident fit decision. "
-            "Never return URLs that are not exact URL strings from candidate_internal_links. Never rewrite, normalize, "
-            "shorten, expand, or invent URLs. Do not select duplicate URLs, URLs in already_scraped_urls, anchor variants, "
-            "tracking URLs when a cleaner candidate exists, login/account/cart/checkout/search/tag/category/archive pages, "
-            "privacy/terms/cookie/accessibility pages, social media pages, media files, images, videos, or unrelated pages "
-            "unless a candidate URL clearly contains essential organization information. "
-            "Decision criteria: set enough_information to true only when scraped_pages provide reliable evidence for most "
-            "of these: what the organization does; who it serves or sells to; its products, services, programs, or "
-            "activities; its mission, audience, beneficiaries, industry, or market; clear relevance or non-relevance to "
-            "target_criteria; a plausible outreach angle aligned with outreach_goal; and any obvious contact, team, or "
-            "organizational context if available. Set enough_information to false when the core activity, target audience, "
-            "services, programs, mission, criteria match, or outreach angle would require guessing, or when important "
-            "context is likely available on unvisited internal pages. "
-            "URL selection priorities, in order: About/Mission/Who We Are/Company overview; Services/Solutions/Products/"
-            "Programs/What We Do; Industries/Customers/Beneficiaries/Use Cases/Case Studies; Team/Leadership/Staff/Board; "
-            "Contact/Locations/Get in Touch; Partners/Community/Fundraising/Donate/Support/Impact; FAQ/Resources/Pricing/"
-            "Membership/Admissions/Eligibility; News/Blog/Events/Reports only when likely to explain current activity or "
-            "audience. If remaining_page_budget is 0, selected_extra_urls must be an empty array. If remaining_page_budget "
-            "is 1, select only the single best remaining URL. Otherwise select a small ordered list, most valuable first, "
-            "and no longer than remaining_page_budget. If no candidate is clearly useful, return an empty array. "
-            "Field requirements: enough_information must be a JSON boolean, not a string. selected_extra_urls must be an "
-            "array of exact URL strings copied only from candidate_internal_links. reason must briefly explain both the "
-            "evidence sufficiency decision and why selected URLs were chosen or not chosen. missing_information must list "
-            "the most important missing facts or evidence gaps; use an empty array if none. confidence must be a number "
-            "from 0.0 to 1.0 indicating confidence in this sufficiency decision, not the prospect fit score."
+            "You are a strict, evidence-based AI prospect discovery analyst ranking discovered internal links for the next "
+            "scraping step. Review scraped_pages, target_criteria, outreach_goal, candidate_internal_links, already_scraped_urls, "
+            "and the remaining page budget. Return JSON only. Do not include markdown, comments, explanations outside JSON, "
+            "extra keys, trailing commas, or null values. Output must be valid JSON parseable by Python json.loads(). "
+            "Use only the discovered link objects provided in candidate_internal_links. Do not browse, invent URLs, rewrite URLs, "
+            "normalize URLs, use outside knowledge, or select URLs not copied exactly from candidate_internal_links. "
+            "Your semantic goal is to choose pages most likely to improve a prospect analysis by revealing what the organization "
+            "or company does, who it serves, its services, products, programs, positioning, audience, beneficiaries, customers, "
+            "partnership or contact information, credibility or trust signals, and uncertainty or risk signals. These are semantic "
+            "evidence goals, not path-name rules. Do not rely on hardcoded page names or path patterns. Base ranking on the full "
+            "link metadata: anchor_text, title, aria_label, surrounding_text, dom_context, source_page, path, and the text already "
+            "scraped. Prefer links whose metadata suggests useful evidence; ignore links that look duplicated, thin, navigational "
+            "only, transactional, account-related, blocked, file/media-oriented, or irrelevant. "
+            "Set homepage_enough to true only when the currently scraped pages already contain enough reliable evidence to create "
+            "a confident prospect card for human review. If homepage_enough is true, ranked_links must be an empty array and "
+            "recommended_next_action must be create_card. If homepage_enough is false, recommended_next_action must be "
+            "scrape_more_pages and ranked_links should contain only the highest-value links, ordered by priority, with no more "
+            "items than remaining_page_budget. If no useful links are available, ranked_links must be an empty array and the "
+            "reason_homepage_enough should explain that analysis will continue with available evidence and uncertainty. "
+            "Each ranked_links item must include url, priority, reason, expected_information, and confidence. priority 1 is the "
+            "highest priority. confidence must be a number from 0.0 to 1.0."
         )
         try:
-            data = self._chat_json(system_prompt, payload, stage="information_need")
+            data = self._chat_json(system_prompt, payload, stage="link_ranking")
         except Exception as exc:  # noqa: BLE001
-            self.logger.warning("[prospect-ai] information decision failed: %s", str(exc))
-            return self._fallback_information_decision(state, website=website, candidate_links=candidate_links)
+            self.logger.warning("[prospect-ai] link ranking failed: %s", str(exc))
+            return self._fallback_link_ranking(
+                state, website=website, candidate_links=candidate_links
+            )
         allowed_urls = {
             str(item.get("url") or "").strip()
             for item in visible_candidate_links
             if str(item.get("url") or "").strip()
         }
-        return InformationDecision(
-            enough_information=self._as_bool(data.get("enough_information")),
-            selected_extra_urls=[
-                url
-                for item in data.get("selected_extra_urls", [])
-                if (url := str(item).strip()) and url in allowed_urls
-            ][:remaining_page_budget],
-            reason=_clean_text(data.get("reason")),
-            missing_information=[
-                _clean_text(item)
-                for item in data.get("missing_information", [])
-                if _clean_text(item)
-            ],
-            confidence=self._as_float(data.get("confidence")),
+        ranked_links: list[RankedInternalLink] = []
+        seen: set[str] = set()
+        for item in data.get("ranked_links", []) or []:
+            if not isinstance(item, dict):
+                continue
+            url = _clean_text(item.get("url"))
+            if not url or url not in allowed_urls or url in seen:
+                continue
+            seen.add(url)
+            try:
+                priority = max(
+                    1, int(float(item.get("priority", len(ranked_links) + 1)))
+                )
+            except (TypeError, ValueError):
+                priority = len(ranked_links) + 1
+            ranked_links.append(
+                RankedInternalLink(
+                    url=url,
+                    priority=priority,
+                    reason=_clean_text(item.get("reason"))
+                    or "AI selected this page as potentially useful evidence.",
+                    expected_information=_clean_text(item.get("expected_information")),
+                    confidence=self._as_float(item.get("confidence")),
+                )
+            )
+        ranked_links = sorted(
+            ranked_links, key=lambda link: (link.priority, -link.confidence)
+        )[:remaining_page_budget]
+        homepage_enough = self._as_bool(data.get("homepage_enough"))
+        recommended_next_action = _clean_text(data.get("recommended_next_action"))
+        if recommended_next_action == "create_card":
+            homepage_enough = True
+        if homepage_enough:
+            recommended_next_action = "create_card"
+            ranked_links = []
+        elif recommended_next_action not in {"scrape_more_pages", "create_card"}:
+            recommended_next_action = "scrape_more_pages"
+        return LinkRankingDecision(
+            ranked_links=ranked_links,
+            homepage_enough=homepage_enough,
+            reason_homepage_enough=_clean_text(data.get("reason_homepage_enough"))
+            or "AI link ranking completed.",
+            recommended_next_action=recommended_next_action,
         )
 
     def create_prospect_card(
@@ -207,16 +398,41 @@ class ProspectAIAnalyzer:
         *,
         website: str,
         reanalysis_instruction: str = "",
+        evidence_chunks: list[EvidenceChunk] | None = None,
     ) -> ProspectCard:
         pages = self._pages_for_site(state, website)
+        evidence_chunks = (
+            evidence_chunks
+            if evidence_chunks is not None
+            else self.build_evidence_chunks(state, website=website)
+        )
+
         if self.client is None or not self.settings.ai_model:
-            return self._fallback_card(state, website=website, reason="AI credentials are missing.")
+            return self._fallback_card(
+                state,
+                website=website,
+                reason="AI credentials are missing.",
+                evidence_chunks=evidence_chunks,
+            )
         payload = {
             "website": website,
             "target_criteria": state.target_criteria,
             "outreach_goal": state.outreach_goal,
             "reanalysis_instruction": reanalysis_instruction,
-            "scraped_pages": self._pages_payload(state, website=website, text_limit=7000),
+            "scraped_pages": self._pages_payload(
+                state, website=website, text_limit=700
+            ),
+            "evidence_chunks": [
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "page_url": chunk.page_url,
+                    "page_title": chunk.page_title,
+                    "text": chunk.text,
+                    "start_index": chunk.start_index,
+                    "end_index": chunk.end_index,
+                }
+                for chunk in evidence_chunks[:70]
+            ],
             "return_format": {
                 "company": "string",
                 "website": "absolute_url",
@@ -243,6 +459,25 @@ class ProspectAIAnalyzer:
                 "next_step": "string",
                 "ai_summary": "short_summary",
                 "ai_reasoning_summary": "short_reasoning_summary",
+                "evidence_snippets": [
+                    {
+                        "evidence_id": "ev_001",
+                        "claim": "string",
+                        "quote": "exact_short_quote_from_evidence_chunks",
+                        "source_url": "absolute_url_from_chunk",
+                        "source_title": "string",
+                        "chunk_id": "chunk_001",
+                        "supports_field": "field_name",
+                        "confidence": "float_0_to_1",
+                    }
+                ],
+                "field_evidence_map": {
+                    "category": ["ev_001"],
+                    "audience": ["ev_002"],
+                    "signals_of_fit": ["ev_003"],
+                    "risk_or_uncertainty_flags": ["ev_004"],
+                    "suggested_offer": ["ev_005"],
+                },
             },
         }
         system_prompt = (
@@ -282,13 +517,23 @@ class ProspectAIAnalyzer:
             "risk_uncertainty_flags should list specific uncertainty reasons. recommended_action and next_step should be "
             "human-review actions such as review, gather more information, approve for CRM consideration, or reject; they "
             "must not claim final approval. ai_summary should summarize the organization and fit in 1-2 sentences. "
-            "ai_reasoning_summary should summarize the evidence-based reasoning in 2-4 concise sentences."
+            "ai_reasoning_summary should summarize the evidence-based reasoning in 2-4 concise sentences. "
+            "Evidence requirements: You must use evidence_chunks as the source for evidence_snippets. Each quote must be an "
+            "exact short quote copied from an evidence chunk, not a paraphrase. Do not invent quotes. Each evidence snippet "
+            "must connect one claim to one source chunk and one supports_field. Use supports_field values matching the fields "
+            "in the prospect card, such as category, target_audience, what_they_do, services_products, signals_of_fit, "
+            "risk_uncertainty_flags, suggested_offer, outreach_angle, pain_point, recommended_contact_type, or why_relevant. "
+            "If direct evidence is missing for a field, do not fabricate evidence; leave that field out of field_evidence_map "
+            "and include the gap in missing_information or risk_uncertainty_flags. field_evidence_map must reference only "
+            "evidence IDs that appear in evidence_snippets."
         )
         try:
             data = self._chat_json(system_prompt, payload, stage="prospect_card")
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("[prospect-ai] prospect card failed: %s", str(exc))
-            return self._fallback_card(state, website=website, reason=str(exc))
+            return self._fallback_card(
+                state, website=website, reason=str(exc), evidence_chunks=evidence_chunks
+            )
 
         try:
             score = int(float(data.get("fit_score", 0)))
@@ -301,6 +546,10 @@ class ProspectAIAnalyzer:
                 "\n".join(page.text for page in pages),
                 "\n".join(page.metadata.get("html_excerpt", "") for page in pages),
             )
+        data = self._attach_validated_evidence(
+            data, evidence_chunks=evidence_chunks, state=state, website=website
+        )
+
         return ProspectCard.from_ai_json(
             data,
             website=website,
@@ -308,6 +557,166 @@ class ProspectAIAnalyzer:
             pages_scraped=[page.final_url for page in pages],
             session_id=state.session_id,
         )
+
+    def _attach_validated_evidence(
+        self,
+        data: dict[str, Any],
+        *,
+        evidence_chunks: list[EvidenceChunk],
+        state: ProspectAnalysisState,
+        website: str,
+    ) -> dict[str, Any]:
+        returned_items = (
+            data.get("evidence_snippets", [])
+            if isinstance(data.get("evidence_snippets"), list)
+            else []
+        )
+        chunk_lookup = {chunk.chunk_id: chunk for chunk in evidence_chunks}
+        valid_snippets: list[dict[str, Any]] = []
+        invalid_count = 0
+        for index, raw_item in enumerate(returned_items, start=1):
+            if not isinstance(raw_item, dict):
+                invalid_count += 1
+                continue
+            quote = _clean_text(raw_item.get("quote"))[:500]
+            if not quote:
+                invalid_count += 1
+                continue
+            chunk_id = _clean_text(raw_item.get("chunk_id"))
+            source_chunk = chunk_lookup.get(chunk_id)
+            search_chunks = (
+                [source_chunk] if source_chunk is not None else evidence_chunks
+            )
+            matching_chunk = next(
+                (
+                    chunk
+                    for chunk in search_chunks
+                    if chunk is not None and _very_close_quote_match(quote, chunk.text)
+                ),
+                None,
+            )
+            if matching_chunk is None:
+                invalid_count += 1
+                continue
+            evidence_id = (
+                _clean_text(raw_item.get("evidence_id"))
+                or f"ev_{len(valid_snippets) + 1:03d}"
+            )
+            valid_snippets.append(
+                {
+                    "evidence_id": evidence_id,
+                    "claim": _clean_text(raw_item.get("claim")),
+                    "quote": quote,
+                    "source_url": _clean_text(raw_item.get("source_url"))
+                    or matching_chunk.page_url,
+                    "source_title": _clean_text(raw_item.get("source_title"))
+                    or matching_chunk.page_title,
+                    "chunk_id": matching_chunk.chunk_id,
+                    "supports_field": _normalize_supports_field(
+                        raw_item.get("supports_field")
+                    ),
+                    "confidence": self._as_float(raw_item.get("confidence")),
+                    "evidence_type": "direct",
+                    "valid": True,
+                }
+            )
+        valid_ids = {item["evidence_id"] for item in valid_snippets}
+        field_map = self._validated_field_evidence_map(
+            data.get("field_evidence_map"), valid_ids, valid_snippets
+        )
+        weak_fields = self._weak_evidence_fields(
+            data, field_map, state=state, website=website
+        )
+        data = dict(data)
+        data["evidence_snippets"] = valid_snippets
+        data["field_evidence_map"] = field_map
+        data["weak_evidence_fields"] = weak_fields
+        data["evidence_validation_summary"] = {
+            "returned_count": len(returned_items),
+            "valid_count": len(valid_snippets),
+            "invalid_count": invalid_count,
+            "chunk_count": len(evidence_chunks),
+            "weak_evidence_fields": weak_fields,
+        }
+        return data
+
+    def _validated_field_evidence_map(
+        self,
+        raw_map: Any,
+        valid_ids: set[str],
+        valid_snippets: list[dict[str, Any]],
+    ) -> dict[str, list[str]]:
+        mapped: dict[str, list[str]] = {}
+        if isinstance(raw_map, dict):
+            for raw_field, raw_ids in raw_map.items():
+                field_name = _normalize_supports_field(raw_field)
+                if isinstance(raw_ids, str):
+                    raw_ids = [raw_ids]
+                if not isinstance(raw_ids, list):
+                    continue
+                for raw_id in raw_ids:
+                    evidence_id = _clean_text(raw_id)
+                    if evidence_id in valid_ids:
+                        mapped.setdefault(field_name, [])
+                        if evidence_id not in mapped[field_name]:
+                            mapped[field_name].append(evidence_id)
+        for snippet in valid_snippets:
+            field_name = _normalize_supports_field(snippet.get("supports_field"))
+            evidence_id = _clean_text(snippet.get("evidence_id"))
+            if field_name and evidence_id in valid_ids:
+                mapped.setdefault(field_name, [])
+                if evidence_id not in mapped[field_name]:
+                    mapped[field_name].append(evidence_id)
+        return mapped
+
+    def _weak_evidence_fields(
+        self,
+        data: dict[str, Any],
+        field_map: dict[str, list[str]],
+        *,
+        state: ProspectAnalysisState,
+        website: str,
+    ) -> list[str]:
+        important_fields = (
+            "category",
+            "target_audience",
+            "what_they_do",
+            "services_products",
+            "signals_of_fit",
+            "risk_uncertainty_flags",
+            "suggested_offer",
+            "outreach_angle",
+        )
+        weak: list[str] = []
+        for field_name in important_fields:
+            value = data.get(field_name)
+            if field_name == "target_audience":
+                value = value or data.get("audience")
+            if field_name == "what_they_do":
+                value = value or data.get("what_the_organization_does")
+            if field_name == "services_products":
+                value = value or data.get("services_or_products")
+            if field_name == "risk_uncertainty_flags":
+                value = value or data.get("risk_or_uncertainty_flags")
+            has_value = bool(
+                _clean_list(value) if isinstance(value, list) else _clean_text(value)
+            )
+            if has_value and not field_map.get(field_name):
+                weak.append(field_name)
+        if not _clean_text(data.get("contact_email")) and not extract_contact_email(
+            state.extracted_text
+        ):
+            weak.append("contact_email")
+        pages = self._pages_for_site(state, website)
+        if len(pages) <= 1:
+            weak.append("only_homepage_available")
+        if any(page.blocked for page in getattr(state, "skipped_pages", [])):
+            weak.append("some_pages_blocked")
+        deduped: list[str] = []
+        for field_name in weak:
+            if field_name not in deduped:
+                deduped.append(field_name)
+        return deduped
 
     def generate_outreach_draft(
         self,
@@ -323,7 +732,9 @@ class ProspectAIAnalyzer:
             "outreach_goal": state.outreach_goal,
             "prospect_card": card.to_dict(),
             "regenerate_instruction": regenerate_instruction,
-            "scraped_page_context": self._pages_payload(state, website=card.website, text_limit=3500),
+            "scraped_page_context": self._pages_payload(
+                state, website=card.website, text_limit=3500
+            ),
             "return_format": {
                 "subject": "string",
                 "body": "string",
@@ -343,8 +754,10 @@ class ProspectAIAnalyzer:
             "company size, locations, intent, urgency, pain points, buying readiness, prior contact, referrals, meetings, "
             "or approval status. If a detail is not clearly supported, do not mention it. If the evidence is weak, generic, "
             "blocked, contradictory, or incomplete, make the email more cautious and exploratory. Do not claim the recipient "
-            "has a confirmed problem unless the evidence directly supports it. One specific, evidence-backed observation is "
-            "better than several weak assumptions. The email must be suitable for human review before sending. "
+            "has a confirmed problem unless the evidence directly supports it. Prefer verified evidence_snippets from "
+            "prospect_card when personalizing the email. Ignore invalid or missing evidence and use safe inferences only when "
+            "the card clearly marks them as uncertain. One specific, evidence-backed observation is better than several weak "
+            "assumptions. The email must be suitable for human review before sending. "
             "Fit-score logic: for fit_score 90-100, write a confident, specific email with a clear value connection and "
             "direct but low-pressure CTA. For 75-89, write a confident but not exaggerated email using one strong "
             "evidence-backed reason for relevance. For 55-74, write an exploratory email and frame the offer as potentially "
@@ -389,14 +802,19 @@ class ProspectAIAnalyzer:
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("[prospect-ai] outreach draft failed: %s", str(exc))
             return self._fallback_outreach_draft(card, state)
-        fallback_subject = _format_email_text(f"Potential collaboration with {card.company}")
+        fallback_subject = _format_email_text(
+            f"Potential collaboration with {card.company}"
+        )
         return {
             "subject": _format_email_text(data.get("subject")) or fallback_subject,
             "body": _format_email_body(data.get("body")),
-            "cta": _format_email_text(data.get("cta")) or "Would you be open to a quick reply if this is relevant?",
+            "cta": _format_email_text(data.get("cta"))
+            or "Would you be open to a quick reply if this is relevant?",
         }
 
-    def _chat_json(self, system_prompt: str, payload: dict[str, Any], *, stage: str) -> dict[str, Any]:
+    def _chat_json(
+        self, system_prompt: str, payload: dict[str, Any], *, stage: str
+    ) -> dict[str, Any]:
         if self.client is None:
             raise ProspectAIError("OPENAI_API_KEY is missing.")
         response = create_chat_completion_with_fallback(
@@ -437,11 +855,19 @@ class ProspectAIAnalyzer:
         except (TypeError, ValueError):
             return 0.0
 
-    def _pages_for_site(self, state: ProspectAnalysisState, website: str) -> list[ScrapedPage]:
-        pages = [page for page in state.scraped_pages if _same_site(page.final_url or page.url, website)]
+    def _pages_for_site(
+        self, state: ProspectAnalysisState, website: str
+    ) -> list[ScrapedPage]:
+        pages = [
+            page
+            for page in state.scraped_pages
+            if _same_site(page.final_url or page.url, website)
+        ]
         return pages or list(state.scraped_pages)
 
-    def _pages_payload(self, state: ProspectAnalysisState, *, website: str, text_limit: int) -> list[dict[str, Any]]:
+    def _pages_payload(
+        self, state: ProspectAnalysisState, *, website: str, text_limit: int
+    ) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
         for page in self._pages_for_site(state, website):
             payload.append(
@@ -451,7 +877,12 @@ class ProspectAIAnalyzer:
                     "text_excerpt": page.text_excerpt(text_limit),
                     "metadata": page.metadata,
                     "links": page.links[:30],
+                    "discovered_links_count": len(page.discovered_links or page.links),
+                    "selected_for_reason": page.selected_for_reason,
+                    "blocked": page.blocked,
+                    "error": page.error,
                     "status": page.status,
+                    "status_code": page.status_code,
                     "strategy": page.strategy,
                 }
             )
@@ -464,23 +895,84 @@ class ProspectAIAnalyzer:
         website: str,
         candidate_links: list[dict[str, Any]],
     ) -> InformationDecision:
-        pages = self._pages_for_site(state, website)
-        text_length = sum(len(page.text or "") for page in pages)
-        enough = text_length >= 1600 or len(pages) >= self.settings.max_pages_to_scrape
-        selected = [
-            str(item.get("url") or "").strip()
-            for item in sorted(candidate_links, key=lambda value: float(value.get("structural_score", 0)), reverse=True)
-            if str(item.get("url") or "").strip()
-        ][: max(0, self.settings.max_pages_to_scrape - len(pages))]
-        return InformationDecision(
-            enough_information=enough,
-            selected_extra_urls=selected,
-            reason="Local fallback used because AI analysis was unavailable.",
-            missing_information=["AI information sufficiency check did not run."],
-            confidence=0.25,
+        ranking = self._fallback_link_ranking(
+            state, website=website, candidate_links=candidate_links
         )
 
-    def _fallback_card(self, state: ProspectAnalysisState, *, website: str, reason: str) -> ProspectCard:
+        return InformationDecision(
+            enough_information=ranking.homepage_enough,
+            selected_extra_urls=[link.url for link in ranking.ranked_links],
+            reason=ranking.reason_homepage_enough,
+            missing_information=["AI information sufficiency check did not run."],
+            confidence=max(
+                [link.confidence for link in ranking.ranked_links], default=0.25
+            ),
+        )
+
+    def _fallback_link_ranking(
+        self,
+        state: ProspectAnalysisState,
+        *,
+        website: str,
+        candidate_links: list[dict[str, Any]],
+    ) -> LinkRankingDecision:
+        pages = self._pages_for_site(state, website)
+        text_length = sum(len(page.text or "") for page in pages)
+        remaining_page_budget = max(0, self.settings.max_pages_to_scrape - len(pages))
+        homepage_enough = (
+            text_length >= 1800 or len(pages) >= self.settings.max_pages_to_scrape
+        )
+        if homepage_enough or remaining_page_budget <= 0:
+            return LinkRankingDecision(
+                ranked_links=[],
+                homepage_enough=True,
+                reason_homepage_enough="Local fallback found enough readable evidence or no remaining page budget.",
+                recommended_next_action="create_card",
+            )
+        ranked_links: list[RankedInternalLink] = []
+        ordered_candidates = sorted(
+            candidate_links,
+            key=lambda value: _safe_structural_score(value.get("structural_score")),
+            reverse=True,
+        )
+        for item in ordered_candidates[:remaining_page_budget]:
+            url = _clean_text(item.get("url"))
+            if not url:
+                continue
+            evidence_hint = _clean_text(
+                item.get("surrounding_text")
+                or item.get("anchor_text")
+                or item.get("title")
+                or item.get("aria_label")
+            )
+            ranked_links.append(
+                RankedInternalLink(
+                    url=url,
+                    priority=len(ranked_links) + 1,
+                    reason="Local fallback ranked this discovered link by available text, DOM context, and structural signal.",
+                    expected_information=evidence_hint[:180],
+                    confidence=0.25,
+                )
+            )
+        return LinkRankingDecision(
+            ranked_links=ranked_links,
+            homepage_enough=False,
+            reason_homepage_enough=(
+                "Local fallback needs more evidence from discovered internal links."
+                if ranked_links
+                else "No internal links were available; analysis will continue with homepage evidence and uncertainty."
+            ),
+            recommended_next_action="scrape_more_pages",
+        )
+
+    def _fallback_card(
+        self,
+        state: ProspectAnalysisState,
+        *,
+        website: str,
+        reason: str,
+        evidence_chunks: list[EvidenceChunk] | None = None,
+    ) -> ProspectCard:
         pages = self._pages_for_site(state, website)
         combined_text = "\n".join(page.text for page in pages)
         first_page = pages[0] if pages else None
@@ -490,12 +982,53 @@ class ProspectAIAnalyzer:
         contact_url = self._fallback_contact_url(pages)
         criteria_terms = {
             token
-            for token in re.findall(r"[A-Za-z][A-Za-z0-9-]{3,}", state.target_criteria.lower())
+            for token in re.findall(
+                r"[A-Za-z][A-Za-z0-9-]{3,}", state.target_criteria.lower()
+            )
             if len(token) > 3
         }
-        matched_terms = [token for token in criteria_terms if token in combined_text.lower()]
-        score = int(min(65, 25 + (len(matched_terms) * 8) + min(len(combined_text) // 700, 20)))
+        matched_terms = [
+            token for token in criteria_terms if token in combined_text.lower()
+        ]
+        score = int(
+            min(65, 25 + (len(matched_terms) * 8) + min(len(combined_text) // 700, 20))
+        )
         fit_status = self.settings.fit_status_for_score(score)
+        evidence_chunks = evidence_chunks or self.build_evidence_chunks(
+            state, website=website
+        )
+        first_chunk = evidence_chunks[0] if evidence_chunks else None
+        fallback_snippets = []
+        field_evidence_map: dict[str, list[str]] = {}
+        if first_chunk is not None:
+            quote = first_chunk.text[:260].strip()
+            fallback_snippets = [
+                EvidenceSnippet(
+                    evidence_id="ev_001",
+                    claim="Readable website evidence was available for manual review.",
+                    quote=quote,
+                    source_url=first_chunk.page_url,
+                    source_title=first_chunk.page_title,
+                    chunk_id=first_chunk.chunk_id,
+                    supports_field="ai_summary",
+                    confidence=0.25,
+                    evidence_type="direct",
+                    valid=True,
+                )
+            ]
+            field_evidence_map = {"ai_summary": ["ev_001"]}
+        weak_evidence_fields = [
+            "category",
+            "target_audience",
+            "services_products",
+            "signals_of_fit",
+            "suggested_offer",
+        ]
+        if not contact_email:
+            weak_evidence_fields.append("contact_email")
+        if len(pages) <= 1:
+            weak_evidence_fields.append("only_homepage_available")
+
         return ProspectCard(
             company=company,
             website=website,
@@ -510,11 +1043,28 @@ class ProspectAIAnalyzer:
             next_step="Review manually before saving or sending outreach.",
             contact_email=contact_email,
             contact_url=contact_url,
-            ai_summary=(combined_text[:280] + "...") if len(combined_text) > 280 else combined_text,
+            ai_summary=(
+                (combined_text[:280] + "...")
+                if len(combined_text) > 280
+                else combined_text
+            ),
             why_relevant="Local fallback found limited evidence; AI review is recommended.",
             ai_reasoning_summary="Generated without AI due to missing or failed AI analysis.",
-            missing_information=["AI analysis did not complete.", "Manual validation is required."],
+            missing_information=[
+                "AI analysis did not complete.",
+                "Manual validation is required.",
+            ],
             risk_uncertainty_flags=["Low-confidence fallback card."],
+            evidence_snippets=fallback_snippets,
+            field_evidence_map=field_evidence_map,
+            weak_evidence_fields=weak_evidence_fields,
+            evidence_validation_summary={
+                "returned_count": len(fallback_snippets),
+                "valid_count": len(fallback_snippets),
+                "invalid_count": 0,
+                "chunk_count": len(evidence_chunks),
+                "weak_evidence_fields": weak_evidence_fields,
+            },
             pages_scraped=[page.final_url for page in pages],
             source_session_id=state.session_id,
         )
@@ -523,7 +1073,10 @@ class ProspectAIAnalyzer:
     def _company_from_title_or_url(title: str, url: str) -> str:
         cleaned_title = _clean_text(title)
         if cleaned_title:
-            return re.split(r"\s[-|:]\s", cleaned_title)[0][:80].strip() or cleaned_title[:80]
+            return (
+                re.split(r"\s[-|:]\s", cleaned_title)[0][:80].strip()
+                or cleaned_title[:80]
+            )
         host = _host(url).removeprefix("www.")
         return host or "Unknown"
 
@@ -533,12 +1086,18 @@ class ProspectAIAnalyzer:
             for link in page.links:
                 url = str(link.get("url") or "")
                 text = str(link.get("anchor_text") or "").lower()
-                if "linkedin.com" in url.lower() or "contact" in text or "contact" in url.lower():
+                if (
+                    "linkedin.com" in url.lower()
+                    or "contact" in text
+                    or "contact" in url.lower()
+                ):
                     return url
         return pages[0].final_url if pages else ""
 
     @staticmethod
-    def _fallback_outreach_draft(card: ProspectCard, state: ProspectAnalysisState) -> dict[str, str]:
+    def _fallback_outreach_draft(
+        card: ProspectCard, state: ProspectAnalysisState
+    ) -> dict[str, str]:
         subject = f"Potential collaboration with {card.company}"
         body = (
             f"Hi {card.company} team,\n\n"

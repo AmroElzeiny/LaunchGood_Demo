@@ -373,6 +373,24 @@ class ResilientFetcher:
                         error="empty_html",
                     )
                     return None
+                if result.status in self._blocked_http_statuses():
+                    self._remember_failure_reason(domain, "blocked_or_forbidden")
+                    self.logger.warning(
+                        "[fetch] strategy=%s returned blocked/denied status=%s for %s; stopping fetch attempts",
+                        strategy_name,
+                        result.status,
+                        url,
+                    )
+                    self._record_fetch_strategy_result(
+                        domain,
+                        strategy_name,
+                        success=False,
+                        latency_ms=latency_ms,
+                        retries=attempt,
+                        status=result.status,
+                        error="blocked_or_forbidden",
+                    )
+                    return result
                 if result.status in {404, 410}:
                     self.logger.info(
                         "[fetch] strategy=%s found terminal status=%s url=%s; stopping further strategies",
@@ -609,6 +627,17 @@ class ResilientFetcher:
     @staticmethod
     def _is_rate_limited_status(status: int) -> bool:
         return int(status or 0) == 429
+    def _blocked_http_statuses(self) -> set[int]:
+        raw_statuses = getattr(self.settings, "blocked_http_statuses", ()) or ()
+        if isinstance(raw_statuses, str):
+            raw_statuses = raw_statuses.replace(";", ",").split(",")
+        statuses: set[int] = set()
+        for raw_status in raw_statuses:
+            try:
+                statuses.add(int(raw_status))
+            except (TypeError, ValueError):
+                continue
+        return statuses
 
     @staticmethod
     def _looks_rate_limited_body(html: str) -> bool:
@@ -694,6 +723,7 @@ class ResilientFetcher:
         priorities = {
             "challenge_or_interstitial": 50,
             "rate_limited": 40,
+            "blocked_or_forbidden": 60,
             "browser_driver_failure": 30,
             "timeout": 20,
             "transient": 10,

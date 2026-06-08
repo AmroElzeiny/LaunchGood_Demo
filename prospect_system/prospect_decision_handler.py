@@ -44,10 +44,14 @@ class ProspectDecisionHandler:
             recipient_email=recipient_email,
         )
         if result.success:
-            self._log(state, "Saved to Google Sheets", stage="decision", url=card.website)
+            self._log(
+                state, "Saved to Google Sheets", stage="decision", url=card.website
+            )
             self._complete(state)
         else:
-            self._error(state, stage="google_sheets", message=result.message, url=card.website)
+            self._error(
+                state, stage="google_sheets", message=result.message, url=card.website
+            )
         return DecisionResult(result.success, result.message)
 
     def move_to_further_review(
@@ -67,10 +71,14 @@ class ProspectDecisionHandler:
             notes=notes,
         )
         if result.success:
-            self._log(state, "Saved to Google Sheets", stage="decision", url=card.website)
+            self._log(
+                state, "Saved to Google Sheets", stage="decision", url=card.website
+            )
             self._complete(state)
         else:
-            self._error(state, stage="google_sheets", message=result.message, url=card.website)
+            self._error(
+                state, stage="google_sheets", message=result.message, url=card.website
+            )
         return DecisionResult(result.success, result.message)
 
     def reject(
@@ -90,10 +98,14 @@ class ProspectDecisionHandler:
             notes=notes,
         )
         if result.success:
-            self._log(state, "Saved to Google Sheets", stage="decision", url=card.website)
+            self._log(
+                state, "Saved to Google Sheets", stage="decision", url=card.website
+            )
             self._complete(state)
         else:
-            self._error(state, stage="google_sheets", message=result.message, url=card.website)
+            self._error(
+                state, stage="google_sheets", message=result.message, url=card.website
+            )
         return DecisionResult(result.success, result.message)
 
     def send_outreach(
@@ -114,8 +126,13 @@ class ProspectDecisionHandler:
             body=body,
         )
         if not send_result.success:
-            self._error(state, stage="gmail", message=send_result.message, url=card.website)
+            self._error(
+                state, stage="gmail", message=send_result.message, url=card.website
+            )
             return DecisionResult(False, send_result.message)
+        self._store_sent_email(
+            state, recipient_email=recipient_email, message=send_result.message
+        )
         self._log(state, "Email sent successfully", stage="gmail", url=card.website)
         return self.approve_to_crm(
             state,
@@ -123,6 +140,34 @@ class ProspectDecisionHandler:
             notes=f"Outreach sent to {recipient_email}",
             recipient_email=recipient_email,
         )
+
+    def send_draft_only(
+        self,
+        state: ProspectAnalysisState,
+        *,
+        card: ProspectCard,
+        recipient_email: str,
+    ) -> DecisionResult:
+        draft = state.outreach_draft or {}
+        subject = str(draft.get("subject") or "").strip()
+        body = str(draft.get("body") or "").strip()
+        if not subject or not body:
+            return DecisionResult(False, "Generate an outreach draft before sending.")
+        send_result = self.gmail.send_email(
+            recipient_email=recipient_email,
+            subject=subject,
+            body=body,
+        )
+        if not send_result.success:
+            self._error(
+                state, stage="gmail", message=send_result.message, url=card.website
+            )
+            return DecisionResult(False, send_result.message)
+        self._store_sent_email(
+            state, recipient_email=recipient_email, message=send_result.message
+        )
+        self._log(state, "Email sent successfully", stage="gmail", url=card.website)
+        return DecisionResult(True, send_result.message)
 
     def _append_card(
         self,
@@ -134,19 +179,26 @@ class ProspectDecisionHandler:
         recipient_email: str = "",
     ) -> SheetAppendResult:
         draft = state.outreach_draft or {}
+        resolved_recipient_email = (
+            recipient_email or str(draft.get("recipient_email") or "").strip()
+        )
+
         row = card.to_sheet_row(
             created_at=utc_now_iso(),
             human_decision=state.human_decision,
             crm_stage=state.crm_stage,
             outreach_goal=state.outreach_goal,
             target_criteria=state.target_criteria,
-            telegram_or_slack_alert_sent=str(getattr(state, "telegram_or_slack_alert_sent", "") or ""),
+            telegram_or_slack_alert_sent=str(
+                getattr(state, "telegram_or_slack_alert_sent", "") or ""
+            ),
             notes=notes,
             outreach_subject=str(draft.get("subject") or ""),
             outreach_body=str(draft.get("body") or ""),
-            recipient_email=recipient_email,
+            recipient_email=resolved_recipient_email,
         )
         result = self.sheets.append_row(tab_name, row)
+        self._log_evidence_summary(state, card=card)
         state.google_sheet_status = result.message
         self.state_logger.write_decision(
             state,
@@ -161,13 +213,38 @@ class ProspectDecisionHandler:
         )
         return result
 
-    def _log(self, state: ProspectAnalysisState, message: str, *, stage: str, url: str = "") -> None:
+    def _log_evidence_summary(
+        self, state: ProspectAnalysisState, *, card: ProspectCard
+    ) -> None:
+        evidence_summary = card.compact_evidence_summary(limit=1800)
+        if not evidence_summary:
+            return
+        step = state.log_step(
+            f"Evidence summary: {evidence_summary}", stage="evidence", url=card.website
+        )
+        self.state_logger.write_step(state, step)
+        self.sheets.append_step(state, step)
+
+    def _store_sent_email(
+        self, state: ProspectAnalysisState, *, recipient_email: str, message: str
+    ) -> None:
+        draft = dict(state.outreach_draft or {})
+        draft["recipient_email"] = recipient_email.strip()
+        draft["sent_status"] = message
+        draft["sent_at"] = utc_now_iso()
+        state.outreach_draft = draft
+
+    def _log(
+        self, state: ProspectAnalysisState, message: str, *, stage: str, url: str = ""
+    ) -> None:
         step = state.log_step(message, stage=stage, url=url)
         self.state_logger.write_step(state, step)
         self.state_logger.write_state_snapshot(state)
         self.sheets.append_step(state, step)
 
-    def _error(self, state: ProspectAnalysisState, *, stage: str, message: str, url: str = "") -> ErrorRecord:
+    def _error(
+        self, state: ProspectAnalysisState, *, stage: str, message: str, url: str = ""
+    ) -> ErrorRecord:
         error = state.add_error(stage=stage, message=message, url=url)
         self.state_logger.write_error(error)
         self.state_logger.write_state_snapshot(state)

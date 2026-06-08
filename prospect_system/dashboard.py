@@ -4,6 +4,7 @@ import copy
 import html
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,6 @@ from prospect_system.prospect_flow import ProspectFlow
 from prospect_system.prospect_scraper import normalize_input_urls
 from prospect_system.telegram_notifier import send_prospect_usage_notification
 
-
 WORKFLOW_STEPS = (
     (1, "Criteria"),
     (2, "Processing"),
@@ -47,6 +47,14 @@ PROGRESS_BAR_HEIGHT_PX = 72
 PROGRESS_DOT_SIZE_PX = 40
 PROGRESS_LINE_TOP_PX = 18
 PROGRESS_LABEL_FONT_PX = 11
+BLOCKED_PUBLIC_CLOUD_MESSAGE = (
+    "Oops! The website security system has blocked my entrance because this system is on a free public cloud service "
+    "website. PLEASE USE ANOTHER URL OR USE CACHED DEMO CONTENT"
+)
+CACHED_DEMO_TEXT_PATH = (
+    PROJECT_ROOT / "prospect_system" / "demo_data" / "sample_prospect_page.txt"
+)
+CACHED_DEMO_WEBSITE_URL = "https://www.launchgood.com/"
 
 
 @dataclass(slots=True)
@@ -84,6 +92,7 @@ def _init_session() -> None:
     st.session_state.setdefault("prospect_run_error", "")
     st.session_state.setdefault("prospect_flash", None)
     st.session_state.setdefault("prospect_current_step", 1)
+    st.session_state.setdefault("prospect_last_blocked_popup_key", "")
     st.session_state.setdefault("prospect_selected_card_index", 0)
     st.session_state.setdefault("prospect_last_decision_metric_key", "")
     st.session_state.setdefault(
@@ -106,7 +115,9 @@ def _format_seconds(seconds: float) -> str:
     return f"{minutes}m {remainder}s"
 
 
-def _time_saved_label(settings: ProspectSettings, state: ProspectAnalysisState | None) -> str:
+def _time_saved_label(
+    settings: ProspectSettings, state: ProspectAnalysisState | None
+) -> str:
     if state is None:
         return "0m"
     manual_seconds = len(state.prospect_cards) * settings.manual_review_minutes * 60
@@ -114,7 +125,9 @@ def _time_saved_label(settings: ProspectSettings, state: ProspectAnalysisState |
     return _format_seconds(saved)
 
 
-def _local_metrics(settings: ProspectSettings, state: ProspectAnalysisState | None) -> dict[str, Any]:
+def _local_metrics(
+    settings: ProspectSettings, state: ProspectAnalysisState | None
+) -> dict[str, Any]:
     cards = state.prospect_cards if state is not None else []
     local = st.session_state["prospect_local_metrics"]
     scores = [card.fit_score for card in cards]
@@ -142,10 +155,15 @@ def _sheet_metrics(settings: ProspectSettings) -> dict[str, Any]:
 def _render_header() -> None:
     st.caption("Prospect Discovery")
     st.title(PAGE_TITLE)
-    st.write("This is you AI assistant for discovering and reaching out to potential customers based on your criteria after which you decide the way to add them to your CRM sheet (DEMO)")
+    st.write(
+        "This is your AI assistant for discovering and reaching out to potential customers based on your criteria, "
+        "after which you decide how to add them to your CRM sheet (DEMO)."
+    )
 
 
-def _render_metrics(settings: ProspectSettings, state: ProspectAnalysisState | None) -> None:
+def _render_metrics(
+    settings: ProspectSettings, state: ProspectAnalysisState | None
+) -> None:
     metrics = _local_metrics(settings, state)
     sheet_metrics = _sheet_metrics(settings)
     for key, value in sheet_metrics.items():
@@ -170,7 +188,9 @@ def _render_metrics(settings: ProspectSettings, state: ProspectAnalysisState | N
 def _render_google_sheet_row(settings: ProspectSettings) -> None:
     st.subheader("CRM Sheet")
     if settings.google_sheet_id:
-        sheet_url = f"https://docs.google.com/spreadsheets/d/{settings.google_sheet_id}/edit"
+        sheet_url = (
+            f"https://docs.google.com/spreadsheets/d/{settings.google_sheet_id}/edit"
+        )
         st.link_button("Open Google Sheet", sheet_url, use_container_width=True)
         return
     st.info("Add GOOGLE_SHEET_ID in .env to show the CRM Google Sheet link.")
@@ -180,7 +200,9 @@ def _render_env_status(settings: ProspectSettings) -> None:
     if not settings.missing_env_values:
         return
     with st.expander("Missing .env values", expanded=False):
-        st.warning("The dashboard can open, but these values are required for the full end-to-end flow:")
+        st.warning(
+            "The dashboard can open, but these values are required for the full end-to-end flow:"
+        )
         for name in settings.missing_env_values:
             st.code(name)
 
@@ -240,8 +262,17 @@ def _go_to_step(step: int) -> None:
     st.rerun()
 
 
-def _step_button(label: str, step: int, key: str, *, button_type: str = "secondary", disabled: bool = False) -> None:
-    if st.button(label, type=button_type, use_container_width=True, key=key, disabled=disabled):
+def _step_button(
+    label: str,
+    step: int,
+    key: str,
+    *,
+    button_type: str = "secondary",
+    disabled: bool = False,
+) -> None:
+    if st.button(
+        label, type=button_type, use_container_width=True, key=key, disabled=disabled
+    ):
         _go_to_step(step)
 
 
@@ -252,7 +283,52 @@ def _has_draft(state: ProspectAnalysisState | None) -> bool:
     return any(str(draft.get(key) or "").strip() for key in ("subject", "body", "cta"))
 
 
-def _is_step_complete(step: int, current_step: int, state: ProspectAnalysisState | None) -> bool:
+def _latest_blocked_error(state: ProspectAnalysisState | None) -> Any | None:
+    if not isinstance(state, ProspectAnalysisState):
+        return None
+    blocked_markers = (
+        "blocked",
+        "forbidden",
+        "captcha",
+        "cloudflare",
+        "challenge",
+        "access denied",
+        "http 401",
+        "http 403",
+        "http 407",
+        "http 429",
+        "http 451",
+    )
+    for error in reversed(state.errors):
+        details = error.details or {}
+        combined = " ".join(
+            [
+                str(error.stage or ""),
+                str(error.message or ""),
+                str(details.get("error_type") or ""),
+                str(details.get("error_message") or ""),
+                str(details.get("raw_error") or ""),
+            ]
+        ).lower()
+        if any(marker in combined for marker in blocked_markers):
+            return error
+    return None
+
+
+def _show_blocked_public_cloud_message(
+    state: ProspectAnalysisState, error: Any
+) -> None:
+    popup_key = f"{state.session_id}:{getattr(error, 'created_at', '')}"
+    if st.session_state.get("prospect_last_blocked_popup_key") != popup_key:
+        if hasattr(st, "toast"):
+            st.toast(BLOCKED_PUBLIC_CLOUD_MESSAGE)
+        st.session_state["prospect_last_blocked_popup_key"] = popup_key
+    st.error(BLOCKED_PUBLIC_CLOUD_MESSAGE)
+
+
+def _is_step_complete(
+    step: int, current_step: int, state: ProspectAnalysisState | None
+) -> bool:
     is_running = bool(st.session_state.get("prospect_analysis_running", False))
     if step == 1:
         return is_running or state is not None
@@ -273,7 +349,11 @@ def _render_workflow_progress(state: ProspectAnalysisState | None) -> None:
         (index for index, (step, _) in enumerate(WORKFLOW_STEPS) if step == current),
         0,
     )
-    progress_percent = 0 if len(WORKFLOW_STEPS) <= 1 else (active_index / (len(WORKFLOW_STEPS) - 1)) * 100
+    progress_percent = (
+        0
+        if len(WORKFLOW_STEPS) <= 1
+        else (active_index / (len(WORKFLOW_STEPS) - 1)) * 100
+    )
     items: list[str] = []
     for step, title in WORKFLOW_STEPS:
         classes = ["step-item"]
@@ -283,14 +363,12 @@ def _render_workflow_progress(state: ProspectAnalysisState | None) -> None:
         if step == current:
             classes.append("active")
         label = f"Step {step} - {title}"
-        items.append(
-            f"""
+        items.append(f"""
             <a class="{' '.join(classes)}" href="?prospect_step={step}" target="_parent" onclick="window.parent.location.search='?prospect_step={step}'; return false;">
                 <span class="step-dot">{'&#10003;' if complete else html.escape(str(step))}</span>
                 <span class="step-label">{html.escape(label)}</span>
             </a>
-            """
-        )
+            """)
     components.html(
         f"""
         <style>
@@ -400,9 +478,13 @@ def _render_workflow_progress(state: ProspectAnalysisState | None) -> None:
     )
 
 
-def _store_background_run_state(registry: _BackgroundRunRegistry, run_id: str, state: ProspectAnalysisState) -> None:
+def _store_background_run_state(
+    registry: _BackgroundRunRegistry, run_id: str, state: ProspectAnalysisState
+) -> None:
     with registry.lock:
         record = registry.runs.setdefault(run_id, _BackgroundRun())
+        if record.done and record.error:
+            return
         record.state = copy.deepcopy(state)
 
 
@@ -430,6 +512,61 @@ def _read_background_run(run_id: str) -> _BackgroundRun | None:
         return copy.deepcopy(record) if record is not None else None
 
 
+def _background_state_snapshot(
+    registry: _BackgroundRunRegistry, run_id: str
+) -> ProspectAnalysisState | None:
+    with registry.lock:
+        record = registry.runs.get(run_id)
+        if record is None or record.state is None:
+            return None
+        return copy.deepcopy(record.state)
+
+
+def _finish_background_run_with_error(
+    registry: _BackgroundRunRegistry,
+    run_id: str,
+    *,
+    settings: ProspectSettings,
+    message: str,
+    stage: str,
+    error_type: str,
+) -> None:
+    state = _background_state_snapshot(registry, run_id)
+    if state is not None:
+        error = state.add_error(
+            stage=stage,
+            message=message,
+            details={
+                "error_type": error_type,
+                "error_message": message,
+                "resolved": "No",
+            },
+        )
+        logger = StateJSONLLogger(settings.prospect_log_dir)
+        logger.write_error(error)
+        if state.ai_step_logs:
+            logger.write_step(state, state.ai_step_logs[-1])
+        logger.write_state_snapshot(state)
+    _finish_background_run(registry, run_id, state=state, error=message)
+
+
+def _run_with_hard_timeout(call: Any, *, timeout_seconds: float) -> Any:
+    timeout_seconds = max(1.0, float(timeout_seconds))
+    executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="prospect-flow-timeout"
+    )
+    future = executor.submit(call)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise TimeoutError(
+            f"prospect flow exceeded {timeout_seconds:.0f}s budget"
+        ) from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def _sync_active_run_from_registry() -> bool:
     run_id = str(st.session_state.get("prospect_active_run_id") or "")
     record = _read_background_run(run_id)
@@ -443,7 +580,10 @@ def _sync_active_run_from_registry() -> bool:
         st.session_state["prospect_active_run_id"] = ""
         st.session_state["prospect_run_error"] = record.error
         if record.error:
-            st.session_state["prospect_flash"] = ("error", f"Prospect analysis failed: {record.error}")
+            st.session_state["prospect_flash"] = (
+                "error",
+                f"Prospect analysis failed: {record.error}",
+            )
         return was_running
     return False
 
@@ -464,28 +604,205 @@ def _run_analysis_worker(
     usage_alert_status = "Yes" if notify_result.success else "No"
     try:
         flow = ProspectFlow(settings, logger)
-        state = flow.run(
-            input_urls=urls,
-            target_criteria=criteria,
-            outreach_goal=goal,
-            progress_callback=lambda updated_state: _store_background_run_state(registry, run_id, updated_state),
+        state = _run_with_hard_timeout(
+            lambda: flow.run(
+                input_urls=urls,
+                target_criteria=criteria,
+                outreach_goal=goal,
+                progress_callback=lambda updated_state: _store_background_run_state(
+                    registry, run_id, updated_state
+                ),
+                timeout_seconds=settings.analysis_timeout_seconds,
+            ),
+            timeout_seconds=settings.analysis_timeout_seconds,
         )
         state.telegram_or_slack_alert_sent = usage_alert_status
+    except TimeoutError:
+        timeout_seconds = int(settings.analysis_timeout_seconds)
+        _finish_background_run_with_error(
+            registry,
+            run_id,
+            settings=settings,
+            message=(
+                f"The live scrape and AI analysis took longer than {timeout_seconds} seconds, "
+                "so I stopped it cleanly. Please try another URL or run cached demo content."
+            ),
+            stage="Processing",
+            error_type="Timeout",
+        )
+        return
     except Exception as exc:  # noqa: BLE001
         _finish_background_run(registry, run_id, error=str(exc))
         return
     _finish_background_run(registry, run_id, state=state)
 
 
-def _render_progress_snapshot(state: ProspectAnalysisState, settings: ProspectSettings) -> None:
+def _run_cached_demo_worker(
+    run_id: str,
+    *,
+    registry: _BackgroundRunRegistry,
+    settings: ProspectSettings,
+    urls: list[str],
+    criteria: str,
+    goal: str,
+) -> None:
+    try:
+        cached_text = CACHED_DEMO_TEXT_PATH.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        _finish_background_run_with_error(
+            registry,
+            run_id,
+            settings=settings,
+            message=f"Cached demo content could not be loaded: {exc}",
+            stage="Processing",
+            error_type="Cached Demo",
+        )
+        return
+    try:
+        flow = ProspectFlow(settings, get_prospect_logger(settings.prospect_log_dir))
+        state = _run_with_hard_timeout(
+            lambda: flow.run_cached_demo(
+                input_urls=urls,
+                target_criteria=criteria,
+                outreach_goal=goal,
+                cached_text=cached_text,
+                progress_callback=lambda updated_state: _store_background_run_state(
+                    registry, run_id, updated_state
+                ),
+                timeout_seconds=settings.analysis_timeout_seconds,
+            ),
+            timeout_seconds=settings.analysis_timeout_seconds,
+        )
+        state.telegram_or_slack_alert_sent = "No"
+    except TimeoutError:
+        timeout_seconds = int(settings.analysis_timeout_seconds)
+        _finish_background_run_with_error(
+            registry,
+            run_id,
+            settings=settings,
+            message=(
+                f"The cached demo analysis took longer than {timeout_seconds} seconds, "
+                "so I stopped it cleanly. Please try again or adjust the AI settings."
+            ),
+            stage="Processing",
+            error_type="Timeout",
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        _finish_background_run(registry, run_id, error=str(exc))
+        return
+    _finish_background_run(registry, run_id, state=state)
+
+
+def _discovered_link_count(state: ProspectAnalysisState) -> int:
+    urls = {
+        str(link.get("url") or "").strip().lower()
+        for page in state.scraped_pages
+        for link in (page.discovered_links or page.links)
+        if str(link.get("url") or "").strip()
+    }
+    return len(urls)
+
+
+def _selected_page_count(state: ProspectAnalysisState) -> int:
+    return sum(
+        1 for page in state.scraped_pages if str(page.selected_for_reason or "").strip()
+    )
+
+
+def _render_scrape_explainability(state: ProspectAnalysisState) -> None:
+    discovered_count = _discovered_link_count(state)
+    selected_count = _selected_page_count(state)
+    skipped_count = len(state.skipped_pages)
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Discovered Links", discovered_count)
+    metric_cols[1].metric("AI Selected Pages", selected_count)
+    metric_cols[2].metric("Scraped Pages", len(state.scraped_pages))
+    metric_cols[3].metric("Skipped / Blocked", skipped_count)
+
+    with st.expander("Dynamic scraping details", expanded=False):
+        scraped_rows = [
+            {
+                "URL": page.final_url or page.url,
+                "Status": page.status_code or page.status or "N/A",
+                "Discovered Links": len(page.discovered_links or page.links),
+                "Selected Because": page.selected_for_reason
+                or "Starting URL / discovered evidence",
+            }
+            for page in state.scraped_pages
+        ]
+        st.caption("Scraped page URLs")
+        st.dataframe(
+            scraped_rows
+            or [
+                {
+                    "URL": "N/A",
+                    "Status": "N/A",
+                    "Discovered Links": 0,
+                    "Selected Because": "N/A",
+                }
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        selected_rows = [
+            {
+                "URL": page.final_url or page.url,
+                "Why AI Selected It": page.selected_for_reason,
+            }
+            for page in state.scraped_pages
+            if str(page.selected_for_reason or "").strip()
+        ]
+        st.caption("AI-selected pages")
+        st.dataframe(
+            selected_rows or [{"URL": "N/A", "Why AI Selected It": "N/A"}],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        skipped_rows = [
+            {
+                "URL": page.final_url or page.url,
+                "Status": page.status_code or page.status or "N/A",
+                "Blocked": "Yes" if page.blocked else "No",
+                "Error": page.error or "N/A",
+                "Selected Because": page.selected_for_reason or "N/A",
+            }
+            for page in state.skipped_pages
+        ]
+        st.caption("Pages skipped or blocked")
+        st.dataframe(
+            skipped_rows
+            or [
+                {
+                    "URL": "N/A",
+                    "Status": "N/A",
+                    "Blocked": "N/A",
+                    "Error": "N/A",
+                    "Selected Because": "N/A",
+                }
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def _render_progress_snapshot(
+    state: ProspectAnalysisState, settings: ProspectSettings
+) -> None:
     is_running = bool(st.session_state.get("prospect_analysis_running", False))
-    eta = state.estimate_remaining_seconds(max_pages_to_scrape=settings.max_pages_to_scrape)
+    eta = state.estimate_remaining_seconds(
+        max_pages_to_scrape=settings.max_pages_to_scrape
+    )
     pages_scraped = len(state.scraped_pages)
     if is_running:
         status = f"Estimated remaining time: {_format_seconds(eta)}"
     else:
         status = f"Pages scraped: {pages_scraped}/{settings.max_pages_to_scrape}"
     st.info(f"Current URL: {state.current_url or 'waiting'} | {status}")
+    if state.scraped_pages or state.skipped_pages:
+        _render_scrape_explainability(state)
     if state.ai_step_logs:
         caption = (
             f"Live visual log refreshes every {_format_seconds(settings.log_refresh_seconds)} while analysis is running."
@@ -605,7 +922,9 @@ def _render_input(settings: ProspectSettings) -> None:
         )
 
 
-def _render_step_log_table(steps: list[Any], *, auto_scroll: bool = False, height: int = 280) -> None:
+def _render_step_log_table(
+    steps: list[Any], *, auto_scroll: bool = False, height: int = 280
+) -> None:
     if auto_scroll:
         _render_scroll_log(steps, height=height)
         return
@@ -624,17 +943,14 @@ def _render_step_log_table(steps: list[Any], *, auto_scroll: bool = False, heigh
 def _render_scroll_log(steps: list[Any], *, height: int) -> None:
     from html import escape
 
-    rows = "\n".join(
-        f"""
+    rows = "\n".join(f"""
         <div class="log-row">
             <div class="log-time">{escape(str(step.created_at))}</div>
             <div class="log-stage">{escape(str(step.stage or 'stage'))}</div>
             <div class="log-message">{escape(str(step.message))}</div>
             <div class="log-url">{escape(str(step.url or ''))}</div>
         </div>
-        """
-        for step in steps
-    )
+        """ for step in steps)
     components.html(
         f"""
         <style>
@@ -698,10 +1014,10 @@ def _start_analysis(settings: ProspectSettings) -> None:
             st.error(error)
         return
     if not urls:
-        st.error("Enter at least one valid website URL.")
+        st.error("Enter one valid website URL.")
         return
     if len(urls) > 1:
-        st.error("Please enter only one website link at a time.")
+        st.error("Enter one website URL at a time.")
         return
     criteria = st.session_state["prospect_target_criteria"].strip()
     goal = st.session_state["prospect_outreach_goal"].strip()
@@ -748,7 +1064,85 @@ def _start_analysis(settings: ProspectSettings) -> None:
     st.rerun()
 
 
-def _record_draft_generated(settings: ProspectSettings, state: ProspectAnalysisState, card_url: str) -> None:
+def _inputs_for_cached_demo(
+    settings: ProspectSettings,
+    state: ProspectAnalysisState | None,
+) -> tuple[list[str], str, str]:
+    if isinstance(state, ProspectAnalysisState):
+        urls = [url for url in state.input_urls if str(url or "").strip()]
+        criteria = state.target_criteria.strip()
+        goal = state.outreach_goal.strip()
+        return urls or [CACHED_DEMO_WEBSITE_URL], criteria, goal
+    urls, _ = normalize_input_urls(
+        str(st.session_state.get("prospect_url_input") or "")
+    )
+    criteria = str(st.session_state.get("prospect_target_criteria") or "").strip()
+    goal = str(st.session_state.get("prospect_outreach_goal") or "").strip()
+    return (
+        urls or [settings.demo_website_url or CACHED_DEMO_WEBSITE_URL],
+        criteria,
+        goal,
+    )
+
+
+def _start_cached_demo_analysis(
+    settings: ProspectSettings, state: ProspectAnalysisState | None = None
+) -> None:
+    urls, criteria, goal = _inputs_for_cached_demo(settings, state)
+    if not criteria or not goal:
+        st.error(
+            "Target criteria and outreach goal are required before running cached demo content."
+        )
+        return
+    if not CACHED_DEMO_TEXT_PATH.exists():
+        st.error(f"Cached demo content is missing: {CACHED_DEMO_TEXT_PATH}")
+        return
+    run_id = uuid4().hex
+    registry = _background_run_registry()
+    initial_state = ProspectAnalysisState.create(
+        input_urls=urls,
+        target_criteria=criteria,
+        outreach_goal=goal,
+    )
+    initial_state.current_url = urls[0] if urls else CACHED_DEMO_WEBSITE_URL
+    initial_state.log_step(
+        "Cached demo analysis queued",
+        stage="Criteria",
+        url=initial_state.current_url,
+    )
+    with registry.lock:
+        registry.runs[run_id] = _BackgroundRun(state=initial_state)
+    st.session_state["prospect_url_input"] = initial_state.current_url
+    st.session_state["prospect_target_criteria"] = criteria
+    st.session_state["prospect_outreach_goal"] = goal
+    st.session_state["prospect_active_run_id"] = run_id
+    st.session_state["prospect_run_error"] = ""
+    st.session_state["prospect_flash"] = None
+    st.session_state["prospect_state"] = initial_state
+    st.session_state["prospect_analysis_running"] = True
+    st.session_state["prospect_selected_card_index"] = 0
+    st.session_state["prospect_last_decision_metric_key"] = ""
+    _set_workflow_step(2)
+    thread = threading.Thread(
+        target=_run_cached_demo_worker,
+        kwargs={
+            "run_id": run_id,
+            "registry": registry,
+            "settings": settings,
+            "urls": urls,
+            "criteria": criteria,
+            "goal": goal,
+        },
+        daemon=True,
+        name=f"prospect-cached-demo-{run_id[:8]}",
+    )
+    thread.start()
+    st.rerun()
+
+
+def _record_draft_generated(
+    settings: ProspectSettings, state: ProspectAnalysisState, card_url: str
+) -> None:
     step = state.log_step("Email draft generated", stage="decision", url=card_url)
     logger = StateJSONLLogger(settings.prospect_log_dir)
     logger.write_step(state, step)
@@ -818,12 +1212,18 @@ def _render_card_details(card: Any) -> None:
         st.markdown("**Uncertainty flags**")
         st.write(", ".join(card.uncertainty_flags) or "None listed")
         st.markdown("**AI reasoning summary**")
-        st.write(card.ai_reasoning_summary or card.ai_summary or "No reasoning summary provided.")
+        st.write(
+            card.ai_reasoning_summary
+            or card.ai_summary
+            or "No reasoning summary provided."
+        )
     if card.contact_url:
         st.link_button("Open Contact URL", card.contact_url, use_container_width=True)
 
 
-def _render_decision_stage(settings: ProspectSettings, state: ProspectAnalysisState) -> None:
+def _render_decision_stage(
+    settings: ProspectSettings, state: ProspectAnalysisState
+) -> None:
     if not state.prospect_cards:
         return
     st.subheader("Output Presentation")
@@ -852,7 +1252,11 @@ def _render_decision_stage(settings: ProspectSettings, state: ProspectAnalysisSt
 
     st.subheader("Decision")
     handler = ProspectDecisionHandler(settings)
-    notes = st.text_area("Decision note", key=f"decision_note_{state.session_id}_{selected_index}", height=80)
+    notes = st.text_area(
+        "Decision note",
+        key=f"decision_note_{state.session_id}_{selected_index}",
+        height=80,
+    )
     cols = st.columns(3)
     if cols[0].button(
         "Approve to CRM tab",
@@ -877,13 +1281,21 @@ def _render_decision_stage(settings: ProspectSettings, state: ProspectAnalysisSt
         disabled=decision_locked,
     ):
         result = handler.reject(state, card=card, notes=notes)
-        _finish_clicked_action(state, result, metric_key="rejected_prospects", success_level="warning")
+        _finish_clicked_action(
+            state, result, metric_key="rejected_prospects", success_level="warning"
+        )
 
     st.divider()
     st.subheader("Outreach Draft")
-    analyzer = ProspectAIAnalyzer(settings, get_prospect_logger(settings.prospect_log_dir))
+    analyzer = ProspectAIAnalyzer(
+        settings, get_prospect_logger(settings.prospect_log_dir)
+    )
     draft_cols = st.columns(3)
-    if draft_cols[0].button("Generate an outreach draft", use_container_width=True, key=f"draft_{state.session_id}_{selected_index}"):
+    if draft_cols[0].button(
+        "Generate an outreach draft",
+        use_container_width=True,
+        key=f"draft_{state.session_id}_{selected_index}",
+    ):
         state.outreach_draft = analyzer.generate_outreach_draft(state, card=card)
         _record_draft_generated(settings, state, card.website)
         st.session_state["prospect_state"] = state
@@ -893,7 +1305,11 @@ def _render_decision_stage(settings: ProspectSettings, state: ProspectAnalysisSt
         key=f"regen_instruction_{state.session_id}_{selected_index}",
         placeholder="Optional direction for a new draft",
     )
-    if draft_cols[1].button("Regenerate the draft", use_container_width=True, key=f"regen_{state.session_id}_{selected_index}"):
+    if draft_cols[1].button(
+        "Regenerate the draft",
+        use_container_width=True,
+        key=f"regen_{state.session_id}_{selected_index}",
+    ):
         state.outreach_draft = analyzer.generate_outreach_draft(
             state,
             card=card,
@@ -908,14 +1324,28 @@ def _render_decision_stage(settings: ProspectSettings, state: ProspectAnalysisSt
         key=f"draft_reject_{state.session_id}_{selected_index}",
         disabled=decision_locked,
     ):
-        result = handler.reject(state, card=card, notes=notes or "Rejected after draft review.")
-        _finish_clicked_action(state, result, metric_key="rejected_prospects", success_level="warning")
+        result = handler.reject(
+            state, card=card, notes=notes or "Rejected after draft review."
+        )
+        _finish_clicked_action(
+            state, result, metric_key="rejected_prospects", success_level="warning"
+        )
 
     if state.outreach_draft:
-        st.text_input("Subject", value=state.outreach_draft.get("subject", ""), disabled=True)
-        st.text_area("Body", value=state.outreach_draft.get("body", ""), height=220, disabled=True)
+        st.text_input(
+            "Subject", value=state.outreach_draft.get("subject", ""), disabled=True
+        )
+        st.text_area(
+            "Body",
+            value=state.outreach_draft.get("body", ""),
+            height=220,
+            disabled=True,
+        )
         st.text_input("CTA", value=state.outreach_draft.get("cta", ""), disabled=True)
-        recipient = st.text_input("What is the email to send to?", key=f"recipient_{state.session_id}_{selected_index}")
+        recipient = st.text_input(
+            "What is the email to send to?",
+            key=f"recipient_{state.session_id}_{selected_index}",
+        )
         st.info(
             f"Don't forget, it's a test, so type your email and you will receive the draft to your email "
             f"from {settings.email_sender_email or 'your configured sender email'} within 30 seconds, I promise."
@@ -936,7 +1366,11 @@ def _render_decision_stage(settings: ProspectSettings, state: ProspectAnalysisSt
         key=f"reanalyze_instruction_{state.session_id}_{selected_index}",
         height=80,
     )
-    if st.button("Re-analyze", use_container_width=True, key=f"reanalyze_{state.session_id}_{selected_index}"):
+    if st.button(
+        "Re-analyze",
+        use_container_width=True,
+        key=f"reanalyze_{state.session_id}_{selected_index}",
+    ):
         flow = ProspectFlow(settings, get_prospect_logger(settings.prospect_log_dir))
         st.session_state["prospect_analysis_running"] = True
 
@@ -986,7 +1420,14 @@ def _html_link(value: str) -> str:
     return f'<a href="{escaped}" target="_blank" rel="noreferrer">{escaped}</a>'
 
 
-def _info_tile(label: str, value: Any, *, large: bool = False, accent: bool = False, raw_html: bool = False) -> str:
+def _info_tile(
+    label: str,
+    value: Any,
+    *,
+    large: bool = False,
+    accent: bool = False,
+    raw_html: bool = False,
+) -> str:
     classes = ["info-tile"]
     if accent:
         classes.append("accent")
@@ -1010,7 +1451,9 @@ def _selected_card_index(state: ProspectAnalysisState) -> int:
     return max(0, min(selected, len(state.prospect_cards) - 1))
 
 
-def _render_new_card_selector(state: ProspectAnalysisState, *, key_suffix: str) -> tuple[int | None, Any | None]:
+def _render_new_card_selector(
+    state: ProspectAnalysisState, *, key_suffix: str
+) -> tuple[int | None, Any | None]:
     if not state.prospect_cards:
         return None, None
     selected_index = _selected_card_index(state)
@@ -1094,7 +1537,9 @@ def _render_empty_output_structure() -> None:
                 _write_field_value(label)
 
     list_cols = st.columns(3)
-    for index, label in enumerate(["Signals of Fit", "Missing Information", "Uncertainty Flags"]):
+    for index, label in enumerate(
+        ["Signals of Fit", "Missing Information", "Uncertainty Flags"]
+    ):
         with list_cols[index]:
             _write_field_value(label)
 
@@ -1104,9 +1549,23 @@ def _render_empty_draft_structure() -> None:
     st.text_input("Subject", value="N/A", disabled=True, key="empty_draft_subject")
     st.text_area("Body", value="N/A", disabled=True, height=180, key="empty_draft_body")
     st.text_input("CTA", value="N/A", disabled=True, key="empty_draft_cta")
+    st.text_input(
+        "Email to send to", value="N/A", disabled=True, key="empty_draft_recipient"
+    )
     action_cols = st.columns(2)
-    action_cols[0].button("Approve draft and decide", use_container_width=True, disabled=True, key="empty_draft_approve")
-    action_cols[1].button("Skip and decide", use_container_width=True, disabled=True, key="empty_draft_skip")
+    action_cols[0].button(
+        "Send email and move forward",
+        use_container_width=True,
+        disabled=True,
+        key="empty_draft_approve",
+    )
+
+    action_cols[1].button(
+        "Skip and decide",
+        use_container_width=True,
+        disabled=True,
+        key="empty_draft_skip",
+    )
 
 
 def _render_empty_decision_structure() -> None:
@@ -1128,11 +1587,32 @@ def _render_empty_decision_structure() -> None:
         ):
             with preview_cols[index % 3]:
                 _write_field_value(label)
-    st.text_area("Decision note", value="N/A", disabled=True, height=80, key="empty_decision_note")
+    st.text_area(
+        "Decision note",
+        value="N/A",
+        disabled=True,
+        height=80,
+        key="empty_decision_note",
+    )
     cols = st.columns(3)
-    cols[0].button("Approve CRM", use_container_width=True, disabled=True, key="empty_decision_approve")
-    cols[1].button("Move to further review", use_container_width=True, disabled=True, key="empty_decision_review")
-    cols[2].button("Move to reject", use_container_width=True, disabled=True, key="empty_decision_reject")
+    cols[0].button(
+        "Approve CRM",
+        use_container_width=True,
+        disabled=True,
+        key="empty_decision_approve",
+    )
+    cols[1].button(
+        "Move to further review",
+        use_container_width=True,
+        disabled=True,
+        key="empty_decision_review",
+    )
+    cols[2].button(
+        "Move to reject",
+        use_container_width=True,
+        disabled=True,
+        key="empty_decision_reject",
+    )
 
 
 def _render_output_card_details(card: Any) -> None:
@@ -1174,7 +1654,10 @@ def _render_output_card_details(card: Any) -> None:
             ("Pain Point", card.pain_point),
             ("Suggested Offer", card.suggested_offer),
             ("Recommended Contact", card.recommended_contact_type),
-            ("Outreach Angle", card.outreach_angle or card.possible_collaboration_angle),
+            (
+                "Outreach Angle",
+                card.outreach_angle or card.possible_collaboration_angle,
+            ),
             ("Next Step", card.next_step or card.recommended_action),
             ("AI Reasoning Summary", card.ai_reasoning_summary or card.ai_summary),
         ]
@@ -1191,11 +1674,156 @@ def _render_output_card_details(card: Any) -> None:
     for index, (label, items) in enumerate(list_fields):
         with list_cols[index]:
             st.caption(label)
-            cleaned = [str(item or "").strip() for item in items if str(item or "").strip()]
+            cleaned = [
+                str(item or "").strip() for item in items if str(item or "").strip()
+            ]
             st.write("\n".join(f"- {item}" for item in cleaned) or "None listed")
 
     with st.expander("Pages scraped", expanded=False):
         st.write("\n".join(f"- {page}" for page in card.pages_scraped) or "None listed")
+
+
+def _snippet_value(snippet: Any, field_name: str, default: Any = "") -> Any:
+    if isinstance(snippet, dict):
+        return snippet.get(field_name, default)
+    return getattr(snippet, field_name, default)
+
+
+def _evidence_snippets_by_id(card: Any) -> dict[str, Any]:
+    snippets = getattr(card, "evidence_snippets", []) or []
+    return {
+        str(_snippet_value(snippet, "evidence_id") or "").strip(): snippet
+        for snippet in snippets
+        if str(_snippet_value(snippet, "evidence_id") or "").strip()
+    }
+
+
+def _format_confidence_percent(value: Any) -> str:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence <= 1:
+        confidence *= 100
+    return f"{max(0, min(confidence, 100)):.0f}%"
+
+
+def _field_claim_text(card: Any, field_name: str) -> str:
+    if field_name == "signals_of_fit":
+        return (
+            "; ".join(getattr(card, "signals_of_fit", []) or []) or "No signal listed"
+        )
+    if field_name == "risk_uncertainty_flags":
+        return (
+            "; ".join(getattr(card, "risk_uncertainty_flags", []) or [])
+            or "No risk listed"
+        )
+    return str(getattr(card, field_name, "") or "").strip() or "N/A"
+
+
+def _field_label(field_name: str) -> str:
+    labels = {
+        "category": "Category",
+        "target_audience": "Audience",
+        "what_they_do": "What They Do",
+        "services_products": "Services / Products",
+        "signals_of_fit": "Signals of Fit",
+        "risk_uncertainty_flags": "Risk / Uncertainty",
+        "suggested_offer": "Suggested Offer",
+        "outreach_angle": "Outreach Angle",
+        "contact_email": "Contact Email",
+        "only_homepage_available": "Only Homepage Available",
+        "some_pages_blocked": "Some Pages Blocked",
+    }
+    return labels.get(field_name, str(field_name).replace("_", " ").title())
+
+
+def _render_evidence_reasoning(card: Any, state: ProspectAnalysisState | None) -> None:
+    st.subheader("Evidence & Reasoning")
+    snippets_by_id = _evidence_snippets_by_id(card)
+    field_map = getattr(card, "field_evidence_map", {}) or {}
+    weak_fields = list(getattr(card, "weak_evidence_fields", []) or [])
+    warnings: list[str] = []
+    if weak_fields:
+        warnings.append("Weak evidence")
+        warnings.append("Needs human review")
+    if not str(getattr(card, "contact_email", "") or "").strip():
+        warnings.append("No contact email found")
+    if state is not None and len(getattr(state, "scraped_pages", []) or []) <= 1:
+        warnings.append("Only homepage was available")
+    if state is not None and any(
+        getattr(page, "blocked", False)
+        for page in getattr(state, "skipped_pages", []) or []
+    ):
+        warnings.append("Some pages were blocked")
+    if warnings:
+        st.warning(" | ".join(dict.fromkeys(warnings)))
+
+    fields = [
+        "category",
+        "target_audience",
+        "what_they_do",
+        "services_products",
+        "signals_of_fit",
+        "risk_uncertainty_flags",
+        "suggested_offer",
+        "outreach_angle",
+    ]
+    cols = st.columns(2)
+    for index, field_name in enumerate(fields):
+        evidence_ids = list(field_map.get(field_name, []) or [])
+        evidence = [
+            snippets_by_id[evidence_id]
+            for evidence_id in evidence_ids
+            if evidence_id in snippets_by_id
+        ]
+        with cols[index % 2]:
+            with st.container(border=True):
+                st.caption(_field_label(field_name))
+                st.write(_field_claim_text(card, field_name))
+                if evidence:
+                    snippet = evidence[0]
+                    st.markdown(f"**Evidence:** \"{_snippet_value(snippet, 'quote')}\"")
+                    source_url = str(
+                        _snippet_value(snippet, "source_url") or ""
+                    ).strip()
+                    if source_url:
+                        st.markdown(f"Source: [{source_url}]({source_url})")
+                    st.caption(
+                        f"Confidence: {_format_confidence_percent(_snippet_value(snippet, 'confidence'))} | Direct evidence"
+                    )
+                else:
+                    st.caption(
+                        "No direct evidence found. Inference based on available content."
+                    )
+
+    all_rows = [
+        {
+            "Quote": _snippet_value(snippet, "quote"),
+            "Source URL": _snippet_value(snippet, "source_url"),
+            "Supports Field": _field_label(
+                str(_snippet_value(snippet, "supports_field") or "")
+            ),
+            "Confidence": _format_confidence_percent(
+                _snippet_value(snippet, "confidence")
+            ),
+        }
+        for snippet in snippets_by_id.values()
+    ]
+    with st.expander("View all evidence snippets", expanded=False):
+        st.dataframe(
+            all_rows
+            or [
+                {
+                    "Quote": "No direct evidence found",
+                    "Source URL": "N/A",
+                    "Supports Field": "N/A",
+                    "Confidence": "N/A",
+                }
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 def _render_unavailable_step(title: str, message: str) -> None:
@@ -1211,7 +1839,9 @@ def _render_unavailable_step(title: str, message: str) -> None:
 def _render_input_step(settings: ProspectSettings) -> None:
     st.subheader("Step 1 - Criteria")
     _render_input(settings)
-    st.info("Enter one website, define the matching criteria, then start the AI analysis.")
+    st.info(
+        "Enter one website, define the matching criteria, then start the AI analysis."
+    )
     if st.button(
         RUN_BUTTON_LABEL,
         type="primary",
@@ -1221,31 +1851,67 @@ def _render_input_step(settings: ProspectSettings) -> None:
         _start_analysis(settings)
 
 
-def _render_processing_step(settings: ProspectSettings, state: ProspectAnalysisState | None) -> None:
+def _render_processing_step(
+    settings: ProspectSettings, state: ProspectAnalysisState | None
+) -> None:
     st.subheader("Step 2 - Processing")
     is_running = bool(st.session_state.get("prospect_analysis_running", False))
     error = str(st.session_state.get("prospect_run_error") or "").strip()
+    blocked_error = _latest_blocked_error(state)
     if is_running:
-        st.info("AI is scraping, reading, and building the prospect card. Live logs appear below.")
+        st.info(
+            "AI is scraping, reading, and building the prospect card. Live logs appear below."
+        )
         _render_live_log_refresh(settings)
-        return
-    if error:
-        st.error(f"Analysis stopped: {error}")
-        _step_button("Go back to Criteria", 1, key="processing_error_back")
-        if isinstance(state, ProspectAnalysisState) and state.ai_step_logs:
-            _render_step_log_table(state.ai_step_logs, auto_scroll=True, height=360)
         return
     if isinstance(state, ProspectAnalysisState) and state.prospect_cards:
         st.success("Analysis is done. The prospect output is ready.")
         cols = st.columns(2)
         with cols[0]:
-            _step_button("Go to results", 3, key="processing_to_results", button_type="primary")
+            _step_button(
+                "Go to results", 3, key="processing_to_results", button_type="primary"
+            )
         with cols[1]:
             _step_button("Go back", 1, key="processing_back")
         _render_progress_snapshot(state, settings)
         return
+    if isinstance(state, ProspectAnalysisState) and blocked_error is not None:
+        _show_blocked_public_cloud_message(state, blocked_error)
+        cols = st.columns(2)
+        with cols[0]:
+            if st.button(
+                "Run with cached demo content",
+                type="primary",
+                use_container_width=True,
+                key="blocked_cached_demo",
+            ):
+                _start_cached_demo_analysis(settings, state)
+        with cols[1]:
+            _step_button("Go back to Criteria", 1, key="blocked_back_to_inputs")
+        _render_scrape_explainability(state)
+        if state.ai_step_logs:
+            _render_step_log_table(state.ai_step_logs, auto_scroll=True, height=360)
+        return
+    if error:
+        st.error(f"Analysis stopped: {error}")
+        cols = st.columns(2)
+        with cols[0]:
+            _step_button("Go back to Criteria", 1, key="processing_error_back")
+        with cols[1]:
+            if st.button(
+                "Run with cached demo content",
+                use_container_width=True,
+                key="processing_error_cached_demo",
+            ):
+                _start_cached_demo_analysis(settings, state)
+        if isinstance(state, ProspectAnalysisState):
+            _render_scrape_explainability(state)
+        if isinstance(state, ProspectAnalysisState) and state.ai_step_logs:
+            _render_step_log_table(state.ai_step_logs, auto_scroll=True, height=360)
+        return
     if isinstance(state, ProspectAnalysisState) and state.ai_step_logs:
         st.warning("The latest run has logs, but no prospect output was created yet.")
+        _render_scrape_explainability(state)
         _render_step_log_table(state.ai_step_logs, auto_scroll=True, height=360)
         return
     st.warning("No analysis is running yet. Start from the Criteria step.")
@@ -1263,11 +1929,15 @@ def _render_output_step(state: ProspectAnalysisState | None) -> None:
     if card is None:
         return
     _render_output_card_details(card)
+    _render_evidence_reasoning(card, state)
+    _render_scrape_explainability(state)
     cols = st.columns(3)
     with cols[0]:
         _step_button("Draft an email", 4, key="output_to_draft", button_type="primary")
     with cols[1]:
-        if st.button("Skip email and decide", use_container_width=True, key="output_skip_email"):
+        if st.button(
+            "Skip email and decide", use_container_width=True, key="output_skip_email"
+        ):
             state.outreach_draft = {}
             st.session_state["prospect_state"] = state
             _go_to_step(5)
@@ -1275,8 +1945,16 @@ def _render_output_step(state: ProspectAnalysisState | None) -> None:
         _step_button("Back to Criteria", 1, key="output_back_inputs")
 
 
-def _generate_draft(settings: ProspectSettings, state: ProspectAnalysisState, card: Any, *, instruction: str = "") -> None:
-    analyzer = ProspectAIAnalyzer(settings, get_prospect_logger(settings.prospect_log_dir))
+def _generate_draft(
+    settings: ProspectSettings,
+    state: ProspectAnalysisState,
+    card: Any,
+    *,
+    instruction: str = "",
+) -> None:
+    analyzer = ProspectAIAnalyzer(
+        settings, get_prospect_logger(settings.prospect_log_dir)
+    )
     state.outreach_draft = analyzer.generate_outreach_draft(
         state,
         card=card,
@@ -1306,7 +1984,40 @@ def _render_draft_fields(state: ProspectAnalysisState, *, selected_index: int) -
     )
 
 
-def _render_draft_step(settings: ProspectSettings, state: ProspectAnalysisState | None) -> None:
+def _draft_recipient_key(state: ProspectAnalysisState, selected_index: int) -> str:
+    return f"draft_recipient_{state.session_id}_{selected_index}"
+
+
+def _send_draft_and_move_forward(
+    settings: ProspectSettings,
+    state: ProspectAnalysisState,
+    card: Any,
+    *,
+    recipient_key: str,
+) -> None:
+    recipient_email = str(st.session_state.get(recipient_key) or "").strip()
+    if not recipient_email:
+        st.warning("Enter the email address you want to send this draft to.")
+        return
+    handler = ProspectDecisionHandler(settings)
+    with st.spinner("Sending email..."):
+        result = handler.send_draft_only(
+            state, card=card, recipient_email=recipient_email
+        )
+    st.session_state["prospect_state"] = state
+    st.session_state["prospect_flash"] = (
+        "success" if result.success else "error",
+        result.message,
+    )
+    if result.success:
+        _go_to_step(5)
+        return
+    st.rerun()
+
+
+def _render_draft_step(
+    settings: ProspectSettings, state: ProspectAnalysisState | None
+) -> None:
     if not isinstance(state, ProspectAnalysisState) or not state.prospect_cards:
         st.subheader("Step 4 - Generate draft")
         _render_empty_draft_structure()
@@ -1322,11 +2033,36 @@ def _render_draft_step(settings: ProspectSettings, state: ProspectAnalysisState 
         st.rerun()
 
     _render_draft_fields(state, selected_index=selected_index)
+    draft = state.outreach_draft or {}
+    recipient_key = _draft_recipient_key(state, selected_index)
+    if recipient_key not in st.session_state:
+        st.session_state[recipient_key] = str(
+            draft.get("recipient_email") or card.contact_email or ""
+        ).strip()
+    st.text_input(
+        "Email to send to",
+        key=recipient_key,
+        placeholder="recipient@example.com",
+    )
+    if draft.get("sent_at") and draft.get("recipient_email"):
+        st.success(f"Email already sent to {draft.get('recipient_email')}.")
     action_cols = st.columns(2)
     with action_cols[0]:
-        _step_button("Approve draft and decide", 5, key=f"draft_approve_{state.session_id}", button_type="primary")
+        if st.button(
+            "Send email and move forward",
+            type="primary",
+            use_container_width=True,
+            key=f"draft_send_{state.session_id}_{selected_index}",
+        ):
+            _send_draft_and_move_forward(
+                settings, state, card, recipient_key=recipient_key
+            )
     with action_cols[1]:
-        if st.button("Skip and decide", use_container_width=True, key=f"draft_skip_{state.session_id}"):
+        if st.button(
+            "Skip and decide",
+            use_container_width=True,
+            key=f"draft_skip_{state.session_id}",
+        ):
             state.outreach_draft = {}
             st.session_state["prospect_state"] = state
             _go_to_step(5)
@@ -1339,7 +2075,11 @@ def _render_draft_step(settings: ProspectSettings, state: ProspectAnalysisState 
         placeholder="Tell the AI what to change in the next draft.",
         height=90,
     )
-    if st.button("Regenerate with note", use_container_width=True, key=f"regen_{state.session_id}_{selected_index}"):
+    if st.button(
+        "Regenerate with note",
+        use_container_width=True,
+        key=f"regen_{state.session_id}_{selected_index}",
+    ):
         with st.spinner("Regenerating draft..."):
             _generate_draft(settings, state, card, instruction=regenerate_instruction)
         st.rerun()
@@ -1352,6 +2092,9 @@ def _decision_preview_html(state: ProspectAnalysisState, card: Any) -> str:
         {_info_tile("Subject", draft.get("subject", ""))}
         {_info_tile("Body", _html_text(draft.get("body", "No email draft was generated."), default="No email draft was generated."), raw_html=True)}
         {_info_tile("CTA", draft.get("cta", "No CTA generated."))}
+        {_info_tile("Recipient Email", draft.get("recipient_email", "Not sent yet"))}
+        {_info_tile("Email Status", draft.get("sent_status", "Not sent yet"))}
+
         """
         if _has_draft(state)
         else _info_tile("Email Draft", "No email draft was generated.")
@@ -1490,7 +2233,9 @@ def _clear_decision_state(state: ProspectAnalysisState) -> None:
 def _undo_decision(settings: ProspectSettings, state: ProspectAnalysisState) -> None:
     _decrement_last_decision_metric()
     _clear_decision_state(state)
-    step = state.log_step("Decision reopened in dashboard", stage="decision", url=state.current_url)
+    step = state.log_step(
+        "Decision reopened in dashboard", stage="decision", url=state.current_url
+    )
     logger = StateJSONLLogger(settings.prospect_log_dir)
     logger.write_step(state, step)
     logger.write_state_snapshot(state)
@@ -1503,7 +2248,12 @@ def _undo_decision(settings: ProspectSettings, state: ProspectAnalysisState) -> 
     st.rerun()
 
 
-def _run_reanalysis(settings: ProspectSettings, state: ProspectAnalysisState, card: Any, instruction: str) -> None:
+def _run_reanalysis(
+    settings: ProspectSettings,
+    state: ProspectAnalysisState,
+    card: Any,
+    instruction: str,
+) -> None:
     instruction = instruction.strip()
     if not instruction:
         st.warning("Add a re-analysis note before running it.")
@@ -1524,11 +2274,40 @@ def _run_reanalysis(settings: ProspectSettings, state: ProspectAnalysisState, ca
                 website=card.website,
                 reanalysis_instruction=instruction,
                 progress_callback=on_progress,
+                timeout_seconds=settings.analysis_timeout_seconds,
             )
+    except TimeoutError:
+        timeout_seconds = int(settings.analysis_timeout_seconds)
+        message = (
+            f"The re-analysis took longer than {timeout_seconds} seconds, so I stopped it cleanly. "
+            "Please try a shorter note or start a new process."
+        )
+        error = state.add_error(
+            stage="Processing",
+            message=message,
+            details={
+                "error_type": "Timeout",
+                "error_message": message,
+                "resolved": "No",
+            },
+        )
+        logger = StateJSONLLogger(settings.prospect_log_dir)
+        logger.write_error(error)
+        if state.ai_step_logs:
+            logger.write_step(state, state.ai_step_logs[-1])
+        logger.write_state_snapshot(state)
+        st.session_state["prospect_state"] = state
+        st.session_state["prospect_flash"] = ("error", message)
+        _set_workflow_step(5)
+        st.rerun()
+        return
     finally:
         st.session_state["prospect_analysis_running"] = False
     st.session_state["prospect_state"] = updated
-    st.session_state["prospect_flash"] = ("success", "Re-analysis completed. Review the updated output.")
+    st.session_state["prospect_flash"] = (
+        "success",
+        "Re-analysis completed. Review the updated output.",
+    )
     _set_workflow_step(3)
     st.rerun()
 
@@ -1543,16 +2322,26 @@ def _render_post_decision_actions(
     st.success(f"{decision}. The workflow is complete.")
     cols = st.columns(3)
     with cols[0]:
-        if st.button("Undo decision step", use_container_width=True, key=f"undo_decision_{state.session_id}_{selected_index}"):
+        if st.button(
+            "Undo decision step",
+            use_container_width=True,
+            key=f"undo_decision_{state.session_id}_{selected_index}",
+        ):
             _undo_decision(settings, state)
     with cols[1]:
         if settings.google_sheet_id:
             sheet_url = f"https://docs.google.com/spreadsheets/d/{settings.google_sheet_id}/edit"
             st.link_button("Open CRM Sheet", sheet_url, use_container_width=True)
         else:
-            st.button("CRM Sheet not configured", use_container_width=True, disabled=True)
+            st.button(
+                "CRM Sheet not configured", use_container_width=True, disabled=True
+            )
     with cols[2]:
-        if st.button(ANOTHER_RUN_LABEL, use_container_width=True, key=f"new_process_{state.session_id}_{selected_index}"):
+        if st.button(
+            ANOTHER_RUN_LABEL,
+            use_container_width=True,
+            key=f"new_process_{state.session_id}_{selected_index}",
+        ):
             _prepare_another_run(state)
             st.rerun()
     reanalysis_instruction = st.text_area(
@@ -1561,11 +2350,17 @@ def _render_post_decision_actions(
         placeholder="Tell the AI what to reconsider before producing a new output.",
         height=90,
     )
-    if st.button("Re-analyze with note", use_container_width=True, key=f"post_decision_reanalyze_{state.session_id}_{selected_index}"):
+    if st.button(
+        "Re-analyze with note",
+        use_container_width=True,
+        key=f"post_decision_reanalyze_{state.session_id}_{selected_index}",
+    ):
         _run_reanalysis(settings, state, card, reanalysis_instruction)
 
 
-def _render_decision_step(settings: ProspectSettings, state: ProspectAnalysisState | None) -> None:
+def _render_decision_step(
+    settings: ProspectSettings, state: ProspectAnalysisState | None
+) -> None:
     if not isinstance(state, ProspectAnalysisState) or not state.prospect_cards:
         st.subheader("Step 5 - Decision")
         _render_empty_decision_structure()
@@ -1580,7 +2375,11 @@ def _render_decision_step(settings: ProspectSettings, state: ProspectAnalysisSta
         return
 
     handler = ProspectDecisionHandler(settings)
-    notes = st.text_area("Decision note", key=f"decision_note_{state.session_id}_{selected_index}", height=90)
+    notes = st.text_area(
+        "Decision note",
+        key=f"decision_note_{state.session_id}_{selected_index}",
+        height=90,
+    )
     cols = st.columns(3)
     if cols[0].button(
         "Approve CRM",
@@ -1603,10 +2402,14 @@ def _render_decision_step(settings: ProspectSettings, state: ProspectAnalysisSta
         key=f"reject_{state.session_id}_{selected_index}",
     ):
         result = handler.reject(state, card=card, notes=notes)
-        _finish_clicked_action(state, result, metric_key="rejected_prospects", success_level="warning")
+        _finish_clicked_action(
+            state, result, metric_key="rejected_prospects", success_level="warning"
+        )
 
 
-def _render_current_step(settings: ProspectSettings, state: ProspectAnalysisState | None) -> None:
+def _render_current_step(
+    settings: ProspectSettings, state: ProspectAnalysisState | None
+) -> None:
     current = _current_step()
     if current == 1:
         _render_input_step(settings)
@@ -1637,10 +2440,14 @@ def main() -> None:
     _render_env_status(settings)
     _render_flash_message()
     state = st.session_state.get("prospect_state")
-    _render_current_step(settings, state if isinstance(state, ProspectAnalysisState) else None)
+    _render_current_step(
+        settings, state if isinstance(state, ProspectAnalysisState) else None
+    )
     st.divider()
     state = st.session_state.get("prospect_state")
-    _render_metrics(settings, state if isinstance(state, ProspectAnalysisState) else None)
+    _render_metrics(
+        settings, state if isinstance(state, ProspectAnalysisState) else None
+    )
 
 
 if __name__ == "__main__":

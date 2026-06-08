@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 from prospect_system.dashboard_state import ProspectAnalysisState, ScrapedPage
 from prospect_system.prospect_card import ProspectCard
 from prospect_system.prospect_config import load_prospect_settings
-from prospect_system.prospect_scraper import normalize_input_urls
+from prospect_system.prospect_flow import ProspectFlow
+from prospect_system.prospect_scraper import ProspectScraper, normalize_input_urls
 
 
 def _set_required_env(monkeypatch) -> None:
@@ -82,16 +86,23 @@ def test_smtp_settings_require_real_password(monkeypatch, tmp_path: Path) -> Non
     assert settings.is_smtp_configured
 
 
-def test_invalid_google_json_is_not_treated_as_configured(monkeypatch, tmp_path: Path) -> None:
+def test_invalid_google_json_is_not_treated_as_configured(
+    monkeypatch, tmp_path: Path
+) -> None:
     _set_required_env(monkeypatch)
     monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", "not-json")
-    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON_PATH", "missing-service-account.json")
+    monkeypatch.setenv(
+        "GOOGLE_SERVICE_ACCOUNT_JSON_PATH", "missing-service-account.json"
+    )
 
     settings = load_prospect_settings(tmp_path)
 
     assert not settings.is_google_configured
     assert "GOOGLE_SERVICE_ACCOUNT_JSON is invalid JSON" in settings.missing_env_values
-    assert "GOOGLE_SERVICE_ACCOUNT_JSON_PATH file not found: missing-service-account.json" in settings.missing_env_values
+    assert (
+        "GOOGLE_SERVICE_ACCOUNT_JSON_PATH file not found: missing-service-account.json"
+        in settings.missing_env_values
+    )
 
 
 def test_state_preserves_logs_pages_and_eta() -> None:
@@ -114,6 +125,102 @@ def test_state_preserves_logs_pages_and_eta() -> None:
     assert state.ai_step_logs[0].message == "Input received"
     assert state.extracted_text == "Example text"
     assert state.estimate_remaining_seconds(max_pages_to_scrape=4) >= 0
+
+
+def test_prospect_scraper_reports_denied_status_as_blocked_http(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _set_required_env(monkeypatch)
+    settings = load_prospect_settings(tmp_path)
+    scraper = ProspectScraper(settings, logging.getLogger("test-prospect-scraper"))
+
+    class _FakeFetcher:
+        async def fetch(self, url: str):
+            return SimpleNamespace(
+                url=url,
+                status=403,
+                html="<html><body>Forbidden</body></html>",
+                page=object(),
+                strategy="fake",
+            )
+
+        def last_failure_reason(self, url: str) -> str:
+            del url
+            return ""
+
+    scraper.fetcher = _FakeFetcher()
+
+    outcome = asyncio.run(
+        scraper.scrape_page("https://example.test/", root_url="https://example.test/")
+    )
+
+    assert outcome.blocked
+    assert outcome.page is None
+    assert outcome.status_code == 403
+    assert outcome.error == "Blocked or forbidden response: HTTP 403"
+
+
+def test_candidate_links_tolerate_bad_structural_scores(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _set_required_env(monkeypatch)
+    settings = load_prospect_settings(tmp_path)
+    flow = ProspectFlow(settings, logging.getLogger("test-prospect-flow"))
+    state = ProspectAnalysisState.create(
+        input_urls=["https://example.test/"],
+        target_criteria="education",
+        outreach_goal="partnership",
+    )
+    state.add_scraped_page(
+        ScrapedPage(
+            url="https://example.test/",
+            final_url="https://example.test/",
+            title="Example",
+            text="Homepage text",
+            discovered_links=[
+                {"url": "https://example.test/good", "structural_score": "2.5"},
+                {"url": "https://example.test/bad", "structural_score": "not-a-number"},
+                {"url": "https://example.test/missing"},
+            ],
+        )
+    )
+
+    candidates = flow._candidate_links_for_site(state, "https://example.test/")
+
+    assert [item["url"] for item in candidates] == [
+        "https://example.test/good",
+        "https://example.test/bad",
+        "https://example.test/missing",
+    ]
+
+
+def test_invalid_string_evidence_is_not_treated_as_valid() -> None:
+    card = ProspectCard.from_ai_json(
+        {
+            "company": "Acme",
+            "website": "https://acme.test/",
+            "category": "Education",
+            "fit_score": 80,
+            "evidence_snippets": [
+                {
+                    "evidence_id": "ev_001",
+                    "quote": "This quote exists but was marked invalid.",
+                    "source_url": "https://acme.test/",
+                    "chunk_id": "chunk_001",
+                    "supports_field": "category",
+                    "valid": "false",
+                }
+            ],
+            "field_evidence_map": {"category": ["ev_001"]},
+        },
+        website="https://acme.test/",
+        fit_status="Strong Fit",
+        pages_scraped=["https://acme.test/"],
+        session_id="prospect-test",
+    )
+
+    assert card.evidence_snippets == []
+    assert card.field_evidence_map == {}
 
 
 def test_prospect_card_sheet_row_contains_decision_and_draft() -> None:

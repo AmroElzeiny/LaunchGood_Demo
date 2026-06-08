@@ -14,7 +14,11 @@ def get_prospect_logger(log_dir: Path) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("prospect-system")
     logger.setLevel(logging.INFO)
-    if not any(isinstance(handler, logging.FileHandler) and handler.baseFilename.endswith("prospect-system.log") for handler in logger.handlers):
+    if not any(
+        isinstance(handler, logging.FileHandler)
+        and handler.baseFilename.endswith("prospect-system.log")
+        for handler in logger.handlers
+    ):
         handler = logging.FileHandler(log_dir / "prospect-system.log", encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         logger.addHandler(handler)
@@ -41,7 +45,9 @@ class StateJSONLLogger:
     def write_state_snapshot(self, state: ProspectAnalysisState) -> None:
         self._append("analysis_runs.jsonl", state.to_dict())
 
-    def write_decision(self, state: ProspectAnalysisState, payload: dict[str, Any]) -> None:
+    def write_decision(
+        self, state: ProspectAnalysisState, payload: dict[str, Any]
+    ) -> None:
         self._append(
             "decisions.jsonl",
             {

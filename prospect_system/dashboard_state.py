@@ -10,14 +10,18 @@ from prospect_system.prospect_card import ProspectCard
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
 
 
 def _parse_iso(value: str) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
+            timezone.utc
+        )
     except ValueError:
         return None
 
@@ -31,7 +35,27 @@ class StepLog:
     eta_seconds: float | None = None
 
     def to_row(self, session_id: str) -> list[Any]:
-        return [self.created_at, session_id, self.stage, self.url, self.message, self.eta_seconds or ""]
+        return [
+            self.created_at,
+            session_id,
+            self.stage,
+            self.url,
+            self.message,
+            self.eta_seconds or "",
+        ]
+
+
+@dataclass(slots=True)
+class EvidenceChunk:
+    chunk_id: str
+    page_url: str
+    page_title: str
+    text: str
+    start_index: int = 0
+    end_index: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(slots=True)
@@ -42,9 +66,25 @@ class ScrapedPage:
     text: str
     metadata: dict[str, str] = field(default_factory=dict)
     links: list[dict[str, Any]] = field(default_factory=list)
+    discovered_links: list[dict[str, Any]] = field(default_factory=list)
+    selected_for_reason: str = ""
+    blocked: bool = False
+    error: str = ""
+    status_code: int = 0
+    extraction_time: str = field(default_factory=utc_now_iso)
     status: int = 0
     strategy: str = ""
     scraped_at: str = field(default_factory=utc_now_iso)
+
+    def __post_init__(self) -> None:
+        if self.status and not self.status_code:
+            self.status_code = self.status
+        if self.status_code and not self.status:
+            self.status = self.status_code
+        if self.links and not self.discovered_links:
+            self.discovered_links = [dict(link) for link in self.links]
+        if self.discovered_links and not self.links:
+            self.links = [dict(link) for link in self.discovered_links]
 
     def text_excerpt(self, limit: int = 5000) -> str:
         return self.text[:limit]
@@ -63,6 +103,8 @@ class ProspectAnalysisState:
     prospect_card: ProspectCard | None = None
     prospect_cards: list[ProspectCard] = field(default_factory=list)
     outreach_draft: dict[str, str] = field(default_factory=dict)
+    skipped_pages: list[ScrapedPage] = field(default_factory=list)
+    evidence_chunks: list[EvidenceChunk] = field(default_factory=list)
     human_decision: str = ""
     crm_stage: str = ""
     google_sheet_status: str = ""
@@ -74,7 +116,9 @@ class ProspectAnalysisState:
     reanalysis_count: int = 0
 
     @classmethod
-    def create(cls, *, input_urls: list[str], target_criteria: str, outreach_goal: str) -> "ProspectAnalysisState":
+    def create(
+        cls, *, input_urls: list[str], target_criteria: str, outreach_goal: str
+    ) -> "ProspectAnalysisState":
         return cls(
             session_id=f"prospect-{uuid4().hex[:12]}",
             input_urls=list(input_urls),
@@ -82,7 +126,14 @@ class ProspectAnalysisState:
             outreach_goal=outreach_goal,
         )
 
-    def log_step(self, message: str, *, stage: str = "", url: str = "", eta_seconds: float | None = None) -> StepLog:
+    def log_step(
+        self,
+        message: str,
+        *,
+        stage: str = "",
+        url: str = "",
+        eta_seconds: float | None = None,
+    ) -> StepLog:
         entry = StepLog(
             message=message,
             stage=stage,
@@ -114,12 +165,29 @@ class ProspectAnalysisState:
 
     def add_scraped_page(self, page: ScrapedPage) -> None:
         self.scraped_pages.append(page)
-        self.extracted_text = "\n\n".join(item.text for item in self.scraped_pages if item.text).strip()
+        self.extracted_text = "\n\n".join(
+            item.text for item in self.scraped_pages if item.text
+        ).strip()
+        self._refresh_processing_time()
+
+    def add_skipped_page(self, page: ScrapedPage) -> None:
+        self.skipped_pages.append(page)
+        self._refresh_processing_time()
+
+    def set_evidence_chunks(self, chunks: list[EvidenceChunk]) -> None:
+        self.evidence_chunks = list(chunks)
         self._refresh_processing_time()
 
     def set_card(self, card: ProspectCard) -> None:
         self.prospect_card = card
-        existing_index = next((idx for idx, item in enumerate(self.prospect_cards) if item.website == card.website), None)
+        existing_index = next(
+            (
+                idx
+                for idx, item in enumerate(self.prospect_cards)
+                if item.website == card.website
+            ),
+            None,
+        )
         if existing_index is None:
             self.prospect_cards.append(card)
         else:
@@ -141,19 +209,24 @@ class ProspectAnalysisState:
         return [
             page
             for page in self.scraped_pages
-            if page.url.strip().lower() == normalized or page.final_url.strip().lower() == normalized
+            if page.url.strip().lower() == normalized
+            or page.final_url.strip().lower() == normalized
         ]
 
     def estimate_remaining_seconds(self, *, max_pages_to_scrape: int) -> float:
         elapsed = max(self.processing_time_seconds, 0.01)
         pages_done = max(len(self.scraped_pages), 1)
         average_per_page = elapsed / pages_done
-        total_possible_pages = max(1, len(self.input_urls) * max(1, max_pages_to_scrape))
+        total_possible_pages = max(
+            1, len(self.input_urls) * max(1, max_pages_to_scrape)
+        )
         pages_remaining = max(0, total_possible_pages - len(self.scraped_pages))
         return pages_remaining * average_per_page
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
-        data["prospect_card"] = self.prospect_card.to_dict() if self.prospect_card else None
+        data["prospect_card"] = (
+            self.prospect_card.to_dict() if self.prospect_card else None
+        )
         data["prospect_cards"] = [card.to_dict() for card in self.prospect_cards]
         return data

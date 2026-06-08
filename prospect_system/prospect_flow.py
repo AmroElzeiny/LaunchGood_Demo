@@ -1,37 +1,28 @@
 from __future__ import annotations
-
+import re
 import asyncio
 import logging
 from collections.abc import Callable
 from typing import Any
-from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from prospect_system.dashboard_state import ProspectAnalysisState
+
+from prospect_system.dashboard_state import ProspectAnalysisState, ScrapedPage
+from prospect_system.google_sheets_client import GoogleSheetsClient
 from prospect_system.logging_utils import StateJSONLLogger
 from prospect_system.prospect_ai_analyzer import ProspectAIAnalyzer
 from prospect_system.prospect_config import ProspectSettings
 from prospect_system.prospect_scraper import ProspectScraper
 
-
 ProgressCallback = Callable[[ProspectAnalysisState], None]
 
-_COMMON_PROSPECT_PATHS = (
-    "/about",
-    "/about-us",
-    "/contact",
-    "/contact-us",
-    "/services",
-    "/solutions",
-    "/programs",
-    "/our-work",
-    "/mission",
-    "/team",
-    "/partners",
-    "/faq",
-    "/support",
-    "/donate",
-    "/get-involved",
-)
+BLOCKED_ERROR_TYPE = "Blocked / Forbidden"
+
+
+def _safe_structural_score(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class ProspectFlow:
@@ -49,15 +40,39 @@ class ProspectFlow:
         target_criteria: str,
         outreach_goal: str,
         progress_callback: ProgressCallback | None = None,
+        timeout_seconds: float | None = None,
     ) -> ProspectAnalysisState:
-        return asyncio.run(
-            self._run_async(
-                input_urls=input_urls,
-                target_criteria=target_criteria,
-                outreach_goal=outreach_goal,
-                progress_callback=progress_callback,
-            )
+        coro = self._run_async(
+            input_urls=input_urls,
+            target_criteria=target_criteria,
+            outreach_goal=outreach_goal,
+            progress_callback=progress_callback,
         )
+
+        if timeout_seconds and timeout_seconds > 0:
+            coro = asyncio.wait_for(coro, timeout=timeout_seconds)
+        return asyncio.run(coro)
+
+    def run_cached_demo(
+        self,
+        *,
+        input_urls: list[str],
+        target_criteria: str,
+        outreach_goal: str,
+        cached_text: str,
+        progress_callback: ProgressCallback | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ProspectAnalysisState:
+        coro = self._run_cached_demo_async(
+            input_urls=input_urls,
+            target_criteria=target_criteria,
+            outreach_goal=outreach_goal,
+            cached_text=cached_text,
+            progress_callback=progress_callback,
+        )
+        if timeout_seconds and timeout_seconds > 0:
+            coro = asyncio.wait_for(coro, timeout=timeout_seconds)
+        return asyncio.run(coro)
 
     def reanalyze(
         self,
@@ -66,15 +81,17 @@ class ProspectFlow:
         website: str,
         reanalysis_instruction: str = "",
         progress_callback: ProgressCallback | None = None,
+        timeout_seconds: float | None = None,
     ) -> ProspectAnalysisState:
-        return asyncio.run(
-            self._reanalyze_async(
-                state=state,
-                website=website,
-                reanalysis_instruction=reanalysis_instruction,
-                progress_callback=progress_callback,
-            )
+        coro = self._reanalyze_async(
+            state=state,
+            website=website,
+            reanalysis_instruction=reanalysis_instruction,
+            progress_callback=progress_callback,
         )
+        if timeout_seconds and timeout_seconds > 0:
+            coro = asyncio.wait_for(coro, timeout=timeout_seconds)
+        return asyncio.run(coro)
 
     async def _run_async(
         self,
@@ -89,7 +106,9 @@ class ProspectFlow:
             target_criteria=target_criteria,
             outreach_goal=outreach_goal,
         )
-        self._log(state, "Input received", stage="input", progress_callback=progress_callback)
+        self._log(
+            state, "Input received", stage="input", progress_callback=progress_callback
+        )
         for missing in self.settings.missing_env_values:
             self._error(
                 state,
@@ -100,9 +119,95 @@ class ProspectFlow:
 
         for website in input_urls:
             state.current_url = website
-            self._log(state, "Starting scrape", stage="scraping", url=website, progress_callback=progress_callback)
-            await self._analyze_one_url(state, website=website, progress_callback=progress_callback)
+            self._log(
+                state,
+                "Starting scrape",
+                stage="scraping",
+                url=website,
+                progress_callback=progress_callback,
+            )
+            await self._analyze_one_url(
+                state, website=website, progress_callback=progress_callback
+            )
 
+        self.state_logger.write_state_snapshot(state)
+        return state
+
+    async def _run_cached_demo_async(
+        self,
+        *,
+        input_urls: list[str],
+        target_criteria: str,
+        outreach_goal: str,
+        cached_text: str,
+        progress_callback: ProgressCallback | None,
+    ) -> ProspectAnalysisState:
+        website = (
+            input_urls[0]
+            if input_urls
+            else self.settings.demo_website_url or "https://www.launchgood.com/"
+        )
+        state = ProspectAnalysisState.create(
+            input_urls=[website],
+            target_criteria=target_criteria,
+            outreach_goal=outreach_goal,
+        )
+        state.current_url = website
+        self._log(
+            state, "Input received", stage="input", progress_callback=progress_callback
+        )
+        for missing in self.settings.missing_env_values:
+            self._error(
+                state,
+                stage="config",
+                message=f"Missing .env value: {missing}",
+                progress_callback=progress_callback,
+            )
+        self._log(
+            state,
+            "Using cached demo content instead of live scraping",
+            stage="scraping",
+            url=website,
+            progress_callback=progress_callback,
+        )
+        page = ScrapedPage(
+            url=website,
+            final_url=website,
+            title="Cached Demo Prospect Page",
+            text=str(cached_text or "").strip(),
+            metadata={"source": "cached_demo"},
+            links=[],
+            status=200,
+            strategy="cached_demo",
+        )
+        state.add_scraped_page(page)
+        self.state_logger.write_state_snapshot(state)
+        self._emit(progress_callback, state)
+        self._log(
+            state,
+            "AI is analyzing cached demo content",
+            stage="ai",
+            url=website,
+            progress_callback=progress_callback,
+        )
+        card = self._create_card_with_evidence(
+            state, website=website, progress_callback=progress_callback
+        )
+        state.set_card(card)
+        self._log(
+            state,
+            "Prospect card created",
+            stage="output",
+            url=website,
+            progress_callback=progress_callback,
+        )
+        self._log(
+            state,
+            "Waiting for human decision",
+            stage="decision",
+            url=website,
+            progress_callback=progress_callback,
+        )
         self.state_logger.write_state_snapshot(state)
         return state
 
@@ -131,14 +236,27 @@ class ProspectFlow:
                 log_message="Scraping homepage",
                 progress_callback=progress_callback,
             )
-        self._log(state, "AI is updating analysis", stage="ai", url=website, progress_callback=progress_callback)
-        card = self.ai.create_prospect_card(
+        self._log(
+            state,
+            "AI is updating analysis",
+            stage="ai",
+            url=website,
+            progress_callback=progress_callback,
+        )
+        card = self._create_card_with_evidence(
             state,
             website=website,
             reanalysis_instruction=reanalysis_instruction,
+            progress_callback=progress_callback,
         )
         state.set_card(card)
-        self._log(state, "Prospect card created", stage="output", url=website, progress_callback=progress_callback)
+        self._log(
+            state,
+            "Prospect card created",
+            stage="output",
+            url=website,
+            progress_callback=progress_callback,
+        )
         self._log(
             state,
             "Waiting for human decision",
@@ -179,91 +297,174 @@ class ProspectFlow:
         )
         if not homepage_added:
             return
+        candidate_links = self._candidate_links_for_site(state, website)
 
-        self._log(state, "AI is analyzing homepage", stage="ai", url=website, progress_callback=progress_callback)
-        decision = self.ai.assess_information_need(
-            state,
-            website=website,
-            candidate_links=self._candidate_links_for_site(state, website),
-        )
         self._log(
             state,
-            decision.reason or "AI information decision completed",
-            stage="ai",
+            f"Discovered {len(candidate_links)} internal link(s) from scraped page metadata",
+            stage="scraping",
             url=website,
             progress_callback=progress_callback,
         )
-        scraped_count = len(self._pages_for_site(state, website))
-        while scraped_count < self.settings.max_pages_to_scrape:
-            candidate_links = self._candidate_links_for_site(state, website)
-            selected_urls = self._unseen_urls_for_site(state, website, decision.selected_extra_urls)
-            if not selected_urls:
-                selected_urls = self._unseen_urls_for_site(
+        if not candidate_links:
+            self._log(
+                state,
+                "No internal links were discovered; continuing with homepage evidence and uncertainty",
+                stage="scraping",
+                url=website,
+                progress_callback=progress_callback,
+            )
+        ranking = self._rank_links(
+            state,
+            website=website,
+            candidate_links=candidate_links,
+            progress_callback=progress_callback,
+        )
+        if ranking.homepage_enough:
+            self._log(
+                state,
+                f"AI says enough information is available: {ranking.reason_homepage_enough}",
+                stage="ai",
+                url=website,
+                progress_callback=progress_callback,
+            )
+        else:
+            self._log_selected_links(
+                state,
+                ranking.ranked_links,
+                url=website,
+                progress_callback=progress_callback,
+            )
+
+        attempted_urls: set[str] = set()
+        while (
+            not ranking.homepage_enough
+            and len(self._pages_for_site(state, website))
+            < self.settings.max_pages_to_scrape
+        ):
+            selected_links = self._unseen_ranked_links(
+                state, website, ranking.ranked_links, attempted_urls
+            )
+            if not selected_links:
+                candidate_links = self._candidate_links_for_site(state, website)
+                if not candidate_links:
+                    self._log(
+                        state,
+                        "No more useful discovered internal links remain; creating output from available evidence",
+                        stage="scraping",
+                        url=website,
+                        progress_callback=progress_callback,
+                    )
+                    break
+                ranking = self._rank_links(
                     state,
-                    website,
-                    [str(link.get("url") or "").strip() for link in candidate_links],
+                    website=website,
+                    candidate_links=candidate_links,
+                    progress_callback=progress_callback,
                 )
-            if not selected_urls:
+                if ranking.homepage_enough:
+                    self._log(
+                        state,
+                        f"AI says enough information is available: {ranking.reason_homepage_enough}",
+                        stage="ai",
+                        url=website,
+                        progress_callback=progress_callback,
+                    )
+                    break
+                selected_links = self._unseen_ranked_links(
+                    state, website, ranking.ranked_links, attempted_urls
+                )
+            if not selected_links:
                 self._log(
                     state,
-                    "No more internal pages were found to scrape before reaching the configured page target",
+                    "AI did not select additional useful pages; creating output from available evidence",
                     stage="scraping",
                     url=website,
                     progress_callback=progress_callback,
                 )
                 break
-            message = (
-                "Enough evidence found, scraping additional relevant pages up to the configured limit"
-                if decision.enough_information
-                else "Decision not enough yet, searching for extra relevant pages"
-            )
-            self._log(
-                state,
-                message,
-                stage="ai",
-                url=website,
-                progress_callback=progress_callback,
-            )
-            for next_url in selected_urls:
-                if len(self._pages_for_site(state, website)) >= self.settings.max_pages_to_scrape:
+            for ranked_link in selected_links:
+                if (
+                    len(self._pages_for_site(state, website))
+                    >= self.settings.max_pages_to_scrape
+                ):
                     break
+                next_url = ranked_link.url
+                attempted_urls.add(next_url.lower())
                 next_page_number = len(self._pages_for_site(state, website)) + 1
+                self._log(
+                    state,
+                    f"AI selected page {next_page_number} of {self.settings.max_pages_to_scrape}: {next_url}",
+                    stage="ai",
+                    url=next_url,
+                    progress_callback=progress_callback,
+                )
+                self._log(
+                    state,
+                    f"Selection reason: {ranked_link.reason}",
+                    stage="ai",
+                    url=next_url,
+                    progress_callback=progress_callback,
+                )
                 added = await self._scrape_and_record(
                     state,
                     url=next_url,
                     root_url=website,
-                    log_message=f"Scraping extra page {next_page_number} of {self.settings.max_pages_to_scrape}",
+                    log_message=f"Scraping page {next_page_number} of {self.settings.max_pages_to_scrape}",
+                    selected_for_reason=ranked_link.reason,
                     progress_callback=progress_callback,
                 )
                 if not added:
                     continue
                 self._log(
                     state,
-                    "AI is updating analysis",
-                    stage="ai",
+                    f"Discovered {len(self._candidate_links_for_site(state, website))} remaining internal link candidate(s)",
+                    stage="scraping",
                     url=website,
                     progress_callback=progress_callback,
                 )
-                decision = self.ai.assess_information_need(
+                ranking = self._rank_links(
                     state,
                     website=website,
                     candidate_links=self._candidate_links_for_site(state, website),
+                    progress_callback=progress_callback,
                 )
+                if ranking.homepage_enough:
+                    self._log(
+                        state,
+                        f"AI says enough information is available: {ranking.reason_homepage_enough}",
+                        stage="ai",
+                        url=website,
+                        progress_callback=progress_callback,
+                    )
+                    break
                 self._log(
                     state,
-                    decision.reason or "AI information decision completed",
+                    "AI says more evidence may help; continuing with selected internal pages",
                     stage="ai",
                     url=website,
                     progress_callback=progress_callback,
                 )
-            new_scraped_count = len(self._pages_for_site(state, website))
-            if new_scraped_count <= scraped_count:
+                self._log_selected_links(
+                    state,
+                    ranking.ranked_links,
+                    url=website,
+                    progress_callback=progress_callback,
+                )
                 break
-            scraped_count = new_scraped_count
 
-        card = self.ai.create_prospect_card(state, website=website)
+        card = self._create_card_with_evidence(
+            state, website=website, progress_callback=progress_callback
+        )
+
         state.set_card(card)
-        self._log(state, "Prospect card created", stage="output", url=website, progress_callback=progress_callback)
+        self._log(
+            state,
+            "Prospect card created",
+            stage="output",
+            url=website,
+            progress_callback=progress_callback,
+        )
         self._log(
             state,
             "Waiting for human decision",
@@ -279,22 +480,53 @@ class ProspectFlow:
         url: str,
         root_url: str,
         log_message: str,
+        selected_for_reason: str = "",
         progress_callback: ProgressCallback | None,
     ) -> bool:
-        self._log(state, log_message, stage="scraping", url=url, progress_callback=progress_callback)
+        self._log(
+            state,
+            log_message,
+            stage="scraping",
+            url=url,
+            progress_callback=progress_callback,
+        )
         outcome = await self.scraper.scrape_page(url, root_url=root_url)
         if outcome.blocked:
-            message = self.settings.captcha_end_message or outcome.error
-            self._error(
+            self._record_skipped_page(
                 state,
-                stage="blocked_page",
+                url=url,
+                final_url=outcome.final_url or url,
+                status_code=outcome.status_code,
+                blocked=True,
+                error=outcome.error,
+                selected_for_reason=selected_for_reason,
+            )
+            message = self.settings.captcha_end_message or outcome.error
+            error = self._error(
+                state,
+                stage="Scraping",
                 message=message,
                 url=url,
-                details={"raw_error": outcome.error},
+                details={
+                    "error_type": BLOCKED_ERROR_TYPE,
+                    "error_message": _blocked_error_message(outcome.error),
+                    "resolved": "No",
+                    "raw_error": outcome.error,
+                },
                 progress_callback=progress_callback,
             )
+            self._append_error_to_sheet(error)
             return False
         if outcome.error:
+            self._record_skipped_page(
+                state,
+                url=url,
+                final_url=outcome.final_url or url,
+                status_code=outcome.status_code,
+                blocked=False,
+                error=outcome.error,
+                selected_for_reason=selected_for_reason,
+            )
             self._error(
                 state,
                 stage="scraping",
@@ -304,6 +536,15 @@ class ProspectFlow:
             )
             return False
         if outcome.page is None:
+            self._record_skipped_page(
+                state,
+                url=url,
+                final_url=outcome.final_url or url,
+                status_code=outcome.status_code,
+                blocked=False,
+                error="Website returned no readable page.",
+                selected_for_reason=selected_for_reason,
+            )
             self._error(
                 state,
                 stage="scraping",
@@ -313,6 +554,15 @@ class ProspectFlow:
             )
             return False
         if not outcome.page.text.strip():
+            self._record_skipped_page(
+                state,
+                url=outcome.page.url,
+                final_url=outcome.page.final_url,
+                status_code=outcome.page.status_code or outcome.page.status,
+                blocked=False,
+                error="Empty scraped content.",
+                selected_for_reason=selected_for_reason,
+            )
             self._error(
                 state,
                 stage="scraping",
@@ -350,68 +600,217 @@ class ProspectFlow:
         )
         return True
 
-    def _candidate_links_for_site(self, state: ProspectAnalysisState, website: str) -> list[dict[str, Any]]:
-        scraped = {
-            str(value or "").strip()
-            for page in self._pages_for_site(state, website)
-            for value in (page.url, page.final_url)
-            if str(value or "").strip()
-        }
-        found: dict[str, dict[str, Any]] = {}
-        for page in self._pages_for_site(state, website):
-            for link in page.links:
-                url = str(link.get("url") or "").strip()
-                if not url or url in scraped:
-                    continue
-                existing = found.get(url)
-                if existing is None or float(link.get("structural_score", 0)) > float(existing.get("structural_score", 0)):
-                    found[url] = dict(link)
-        for link in self._fallback_probe_links(website, scraped | set(found)):
-            found.setdefault(str(link["url"]), link)
-        return sorted(found.values(), key=lambda item: float(item.get("structural_score", 0)), reverse=True)
-
-    @staticmethod
-    def _fallback_probe_links(website: str, excluded_urls: set[str]) -> list[dict[str, Any]]:
-        parsed = urlsplit(website)
-        if not parsed.scheme or not parsed.netloc:
-            return []
-        root = urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
-        excluded = {url.strip().lower() for url in excluded_urls if url.strip()}
-        links: list[dict[str, Any]] = []
-        for index, path in enumerate(_COMMON_PROSPECT_PATHS):
-            url = urljoin(root, path.lstrip("/"))
-            if url.lower() in excluded:
-                continue
-            links.append(
-                {
-                    "url": url,
-                    "anchor_text": path.strip("/").replace("-", " ").title(),
-                    "source_page": root,
-                    "structural_score": 1.5 - (index * 0.02),
-                }
-            )
-        return links
-
-    def _unseen_urls_for_site(
+    def _rank_links(
         self,
         state: ProspectAnalysisState,
+        *,
         website: str,
-        urls: list[str],
-    ) -> list[str]:
+        candidate_links: list[dict[str, Any]],
+        progress_callback: ProgressCallback | None,
+    ) -> Any:
+        self._log(
+            state,
+            f"AI is ranking {len(candidate_links)} discovered internal link candidate(s)",
+            stage="ai",
+            url=website,
+            progress_callback=progress_callback,
+        )
+        ranking = self.ai.rank_internal_links(
+            state,
+            website=website,
+            candidate_links=candidate_links,
+        )
+        if ranking.homepage_enough:
+            return ranking
+        self._log(
+            state,
+            f"AI selected {len(ranking.ranked_links)} useful page(s) for possible scraping",
+            stage="ai",
+            url=website,
+            progress_callback=progress_callback,
+        )
+        return ranking
+
+    def _create_card_with_evidence(
+        self,
+        state: ProspectAnalysisState,
+        *,
+        website: str,
+        reanalysis_instruction: str = "",
+        progress_callback: ProgressCallback | None,
+    ) -> Any:
+        try:
+            chunks = self.ai.build_evidence_chunks(state, website=website)
+            state.set_evidence_chunks(chunks)
+            self._log(
+                state,
+                f"Created {len(chunks)} evidence chunk(s)",
+                stage="evidence",
+                url=website,
+                progress_callback=progress_callback,
+            )
+            if not chunks:
+                self._log(
+                    state,
+                    "Evidence extraction failed or returned weak support.",
+                    stage="evidence",
+                    url=website,
+                    progress_callback=progress_callback,
+                )
+        except Exception as exc:  # noqa: BLE001
+            chunks = []
+            self._error(
+                state,
+                stage="evidence",
+                message=f"Evidence extraction failed or returned weak support: {exc}",
+                url=website,
+                progress_callback=progress_callback,
+            )
+        card = self.ai.create_prospect_card(
+            state,
+            website=website,
+            reanalysis_instruction=reanalysis_instruction,
+            evidence_chunks=chunks,
+        )
+        summary = card.evidence_validation_summary or {}
+        returned_count = int(summary.get("returned_count") or 0)
+        valid_count = int(summary.get("valid_count") or len(card.evidence_snippets))
+        weak_fields = list(
+            summary.get("weak_evidence_fields") or card.weak_evidence_fields or []
+        )
+        self._log(
+            state,
+            f"AI returned {returned_count} evidence snippet(s)",
+            stage="evidence",
+            url=website,
+            progress_callback=progress_callback,
+        )
+        self._log(
+            state,
+            f"Validated {valid_count} of {returned_count} evidence snippet(s)",
+            stage="evidence",
+            url=website,
+            progress_callback=progress_callback,
+        )
+        if weak_fields:
+            self._log(
+                state,
+                f"{len(weak_fields)} field(s) need human review due to weak evidence",
+                stage="evidence",
+                url=website,
+                progress_callback=progress_callback,
+            )
+        return card
+
+    def _log_selected_links(
+        self,
+        state: ProspectAnalysisState,
+        ranked_links: list[Any],
+        *,
+        url: str,
+        progress_callback: ProgressCallback | None,
+    ) -> None:
+        for ranked_link in ranked_links:
+            expected = (
+                f" Expected: {ranked_link.expected_information}"
+                if ranked_link.expected_information
+                else ""
+            )
+            self._log(
+                state,
+                f"Rank {ranked_link.priority}: {ranked_link.url} | {ranked_link.reason}{expected}",
+                stage="ai",
+                url=url,
+                progress_callback=progress_callback,
+            )
+
+    def _record_skipped_page(
+        self,
+        state: ProspectAnalysisState,
+        *,
+        url: str,
+        final_url: str,
+        status_code: int,
+        blocked: bool,
+        error: str,
+        selected_for_reason: str,
+    ) -> None:
+        state.add_skipped_page(
+            ScrapedPage(
+                url=url,
+                final_url=final_url or url,
+                title="",
+                text="",
+                metadata={},
+                links=[],
+                discovered_links=[],
+                selected_for_reason=selected_for_reason,
+                blocked=blocked,
+                error=error,
+                status_code=status_code,
+                status=status_code,
+                strategy="blocked" if blocked else "skipped",
+            )
+        )
+        self.state_logger.write_state_snapshot(state)
+
+    def _candidate_links_for_site(
+        self, state: ProspectAnalysisState, website: str
+    ) -> list[dict[str, Any]]:
         scraped = {
             str(value or "").strip().lower()
             for page in self._pages_for_site(state, website)
             for value in (page.url, page.final_url)
             if str(value or "").strip()
         }
-        selected: list[str] = []
+        skipped = {
+            str(value or "").strip().lower()
+            for page in self._skipped_pages_for_site(state, website)
+            for value in (page.url, page.final_url)
+            if str(value or "").strip()
+        }
+        found: dict[str, dict[str, Any]] = {}
+        for page in self._pages_for_site(state, website):
+            for link in page.discovered_links or page.links:
+                url = str(link.get("url") or "").strip()
+                if not url or url.lower() in scraped or url.lower() in skipped:
+                    continue
+                existing = found.get(url)
+                if existing is None or _safe_structural_score(
+                    link.get("structural_score")
+                ) > _safe_structural_score(existing.get("structural_score")):
+                    found[url] = dict(link)
+        return sorted(
+            found.values(),
+            key=lambda item: _safe_structural_score(item.get("structural_score")),
+            reverse=True,
+        )
+
+    def _unseen_ranked_links(
+        self,
+        state: ProspectAnalysisState,
+        website: str,
+        ranked_links: list[Any],
+        attempted_urls: set[str],
+    ) -> list[Any]:
+        unavailable = {
+            str(value or "").strip().lower()
+            for page in [
+                *self._pages_for_site(state, website),
+                *self._skipped_pages_for_site(state, website),
+            ]
+            for value in (page.url, page.final_url)
+            if str(value or "").strip()
+        } | {url.lower() for url in attempted_urls}
+        selected: list[Any] = []
         seen: set[str] = set()
-        for raw_url in urls:
-            url = str(raw_url or "").strip()
+        for ranked_link in ranked_links:
+            url = str(getattr(ranked_link, "url", "") or "").strip()
+
             key = url.lower()
-            if not url or key in scraped or key in seen:
+            if not url or key in unavailable or key in seen:
                 continue
-            selected.append(url)
+            selected.append(ranked_link)
             seen.add(key)
         return selected
 
@@ -419,8 +818,24 @@ class ProspectFlow:
     def _pages_for_site(state: ProspectAnalysisState, website: str) -> list[Any]:
         from prospect_system.prospect_ai_analyzer import _same_site
 
-        pages = [page for page in state.scraped_pages if _same_site(page.final_url or page.url, website)]
+        pages = [
+            page
+            for page in state.scraped_pages
+            if _same_site(page.final_url or page.url, website)
+        ]
         return pages or []
+
+    @staticmethod
+    def _skipped_pages_for_site(
+        state: ProspectAnalysisState, website: str
+    ) -> list[Any]:
+        from prospect_system.prospect_ai_analyzer import _same_site
+
+        return [
+            page
+            for page in state.skipped_pages
+            if _same_site(page.final_url or page.url, website)
+        ]
 
     def _log(
         self,
@@ -431,7 +846,9 @@ class ProspectFlow:
         url: str = "",
         progress_callback: ProgressCallback | None,
     ) -> None:
-        eta_seconds = state.estimate_remaining_seconds(max_pages_to_scrape=self.settings.max_pages_to_scrape)
+        eta_seconds = state.estimate_remaining_seconds(
+            max_pages_to_scrape=self.settings.max_pages_to_scrape
+        )
         step = state.log_step(message, stage=stage, url=url, eta_seconds=eta_seconds)
         self.state_logger.write_step(state, step)
         self.state_logger.write_state_snapshot(state)
@@ -446,16 +863,37 @@ class ProspectFlow:
         url: str = "",
         details: dict[str, Any] | None = None,
         progress_callback: ProgressCallback | None,
-    ) -> None:
+    ) -> Any:
         error = state.add_error(stage=stage, message=message, url=url, details=details)
         self.state_logger.write_error(error)
         if state.ai_step_logs:
             self.state_logger.write_step(state, state.ai_step_logs[-1])
         self.state_logger.write_state_snapshot(state)
         self._emit(progress_callback, state)
+        return error
+
+    def _append_error_to_sheet(self, error: Any) -> None:
+        try:
+            result = GoogleSheetsClient(self.settings).append_error(error)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(
+                "[prospect-sheets] failed to save scraping error: %s", str(exc)
+            )
+            return
+        if not result.success:
+            self.logger.warning("[prospect-sheets] %s", result.message)
 
     @staticmethod
-    def _emit(progress_callback: ProgressCallback | None, state: ProspectAnalysisState) -> None:
+    def _emit(
+        progress_callback: ProgressCallback | None, state: ProspectAnalysisState
+    ) -> None:
         if progress_callback is None:
             return
         progress_callback(state)
+
+
+def _blocked_error_message(raw_error: str) -> str:
+    match = re.search(r"\bHTTP\s+(\d{3})\b", str(raw_error or ""), flags=re.IGNORECASE)
+    if match:
+        return f"HTTP {match.group(1)}"
+    return str(raw_error or "Blocked or forbidden response").strip()

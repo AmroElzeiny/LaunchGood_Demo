@@ -14,13 +14,19 @@ class TelegramNotifyResult:
     message: str
 
 
-def send_prospect_usage_notification(settings: ProspectSettings, *, input_urls: list[str]) -> TelegramNotifyResult:
+def send_prospect_usage_notification(
+    settings: ProspectSettings, *, input_urls: list[str]
+) -> TelegramNotifyResult:
     token = settings.telegram_bot_token.strip()
     chat_id = settings.prospect_usage_notify_chat_id.strip()
     if not token or not chat_id:
-        return TelegramNotifyResult(False, "Telegram usage notification is not configured.")
+        return TelegramNotifyResult(
+            False, "Telegram usage notification is not configured."
+        )
 
-    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    timestamp = (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
     websites = "\n".join(f"- {url}" for url in input_urls) or "- Unknown"
     text = (
         "Prospect dashboard is being used.\n\n"
@@ -44,6 +50,8 @@ def send_prospect_usage_notification(settings: ProspectSettings, *, input_urls: 
         with urlopen(request, timeout=8) as response:
             if 200 <= int(response.status) < 300:
                 return TelegramNotifyResult(True, "Telegram usage notification sent.")
-            return TelegramNotifyResult(False, f"Telegram API returned HTTP {response.status}.")
+            return TelegramNotifyResult(
+                False, f"Telegram API returned HTTP {response.status}."
+            )
     except Exception as exc:  # noqa: BLE001
         return TelegramNotifyResult(False, f"Telegram usage notification failed: {exc}")
