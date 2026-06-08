@@ -1,0 +1,10 @@
+# sphere|label|url
+ux/ui web design|Freelance Marketplaces | Upwork|https://www.upwork.com/freelance-jobs/uiux/
+ux/ui web design|Freelance Marketplaces | Contra|https://contra.com/opportunities?search=ui%2Fux%20designer
+ux/ui web design|Contract / Project Boards | Dribbble|https://dribbble.com/jobs?location=Anywhere&remote=true
+ux/ui web design|Contract / Project Boards | We Work Remotely|https://weworkremotely.com/categories/remote-design-jobs
+ux/ui web design|Startup / Client Request Boards | Work at a Startup|https://www.workatastartup.com/jobs
+ux/ui web design|Startup / Client Request Boards | Y Combinator Jobs|https://www.ycombinator.com/jobs
+ux/ui web design|Mixed Opportunity Boards (Optional) | Wellfound|https://wellfound.com/role/ui-ux-designer
+ux/ui web design|Mixed Opportunity Boards (Optional) | Built In|https://builtin.com/jobs/remote/hybrid/office/designer?search=Web+Designer&allLocations=true
+ux/ui web design|Mixed Opportunity Boards (Optional) | FlexJobs|https://www.flexjobs.com/remote-jobs/ux-designer?sortbyposteddate=true&page=1

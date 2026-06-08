@@ -1,0 +1,56 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.local.env
+env- Copy.env
+service-account*.json
+*-service-account.json
+prospect_system/my_project.json
+*credentials*.json
+*.pem
+*.key
+
+# Virtual environments and package caches
+.venv/
+venv/
+env/
+pip/
+.pip/
+pip-cache/
+token.json
+__pycache__/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime state, logs, and generated output
+state/*
+!state/.gitkeep
+output/*
+!output/.gitkeep
+logs/
+*.log
+*.jsonl
+*.json
+*.db
+*.sqlite
+*.sqlite3
+
+# Browser/runtime artifacts
+.cache_scrapling/
+playwright-report/
+test-results/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
